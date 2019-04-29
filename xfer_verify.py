@@ -68,5 +68,10 @@ def main():
         logging.info("File verification successful: Destination (%s) and source (%s) have matching"
             " SHA1 digest (%s)", args.dest, src_fname, src_hexdigest)
 
+    with open(args.metadata_summary, "a") as md_fd:
+        md_fd.write("{} {} {}\n".format(src_fname, src_hexdigest, src_size).encode('utf-8'))
+        os.fsync(md_fd.fileno())
+
+
 if __name__ == '__main__':
     main()
