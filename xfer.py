@@ -25,7 +25,7 @@ JOB CalculateWork calc_work.sub DIR calc_work
 
 # Gather the local file listing and write out the sub-DAG
 # to perform the actual transfers
-SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {other_args}
+SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {other_args}
 
 SUBDAG EXTERNAL DoXfers calc_work/do_work.dag
 
@@ -61,6 +61,21 @@ transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).me
 queue
 """
 
+XFER_VERIFY_JOB = \
+"""
+universe = vanilla
+executable = {}
+output = $(src_file_noslash).out
+error = $(src_file_noslash).err
+log = xfer_file.log
+arguments = verify_remote $(src_file)
+should_transfer_files = YES
+transfer_output_files = metadata
+transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
+
+queue
+"""
+
 DO_WORK_DAG_HEADER = \
 """
 CATEGORY ALL_NODES TRANSFER_JOBS
@@ -68,13 +83,23 @@ CATEGORY ALL_NODES TRANSFER_JOBS
 
 """
 
-DO_WORK_DAG_SNIPPET = \
+DO_WORK_DAG_XFER_SNIPPET = \
 """
 JOB xfer_{name} xfer_file.sub DIR calc_work
 VARS xfer_{name} src_file_noslash="{src_file_noslash}"
 VARS xfer_{name} src_file="{src_file}"
 VARS xfer_{name} dst_file="{dest}"
-SCRIPT POST xfer_{name} {xfer_py} verify {dest} {src_file_noslash}.metadata transfer_manifest.txt
+SCRIPT POST xfer_{name} {xfer_py} verify {dest} {src_file_noslash}.metadata {transfer_manifest}
+
+"""
+
+DO_WORK_DAG_VERIFY_SNIPPET = \
+"""
+JOB verify_{name} verify_file.sub DIR calc_work
+VARS verify_{name} src_file_noslash="{src_file_noslash}"
+VARS verify_{name} src_file="{src_file}"
+VARS verify_{name} dst_file="{dest}"
+SCRIPT POST verify_{name} {xfer_py} verify {dest} {src_file_noslash}.metadata {transfer_manifest}
 
 """
 
@@ -93,7 +118,7 @@ def parse_args():
     parser_sync.add_argument("src")
     parser_sync.add_argument("dest")
     parser_sync.add_argument("--working-dir", help="Directory to place working HTCondor files.",
-        default=None, dest="working_dir")
+        default="./scratch_dir", dest="working_dir")
     parser_sync.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
 
@@ -107,11 +132,15 @@ def parse_args():
     parser_subdag.add_argument("source_manifest")
     parser_subdag.add_argument("dest_prefix")
     parser_subdag.add_argument("dest_manifest")
+    parser_subdag.add_argument("transfer_manifest")
     parser_subdag.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
 
     parser_exec = subparsers.add_parser("exec")
     parser_exec.add_argument("src")
+
+    parser_verify_remote = subparsers.add_parser("verify_remote")
+    parser_verify_remote.add_argument("src")
 
     parser_verify = subparsers.add_parser("verify")
     parser_verify.add_argument("dest")
@@ -144,7 +173,8 @@ def submit_parent_dag(working_dir, source_dir, dest_dir, test_mode=False):
 
     with open(os.path.join(working_dir, "xfer.dag"), "w") as fd:
         fd.write(PARENT_DAG.format(exec_py=full_exec_path, source_prefix=source_dir,
-            dest_prefix=dest_dir, other_args="--test-mode" if test_mode else ""))
+            dest_prefix=dest_dir, other_args="--test-mode" if test_mode else "",
+            transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt")))
 
     with open(os.path.join(working_dir, "calc_work", "calc_work.sub"), "w") as fd:
         fd.write(CALC_WORK_JOB.format(exec_py=full_exec_path, source_dir=source_dir,
@@ -205,21 +235,51 @@ def parse_manifest(prefix, manifest, log_name):
     return files
 
 
-def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, test_mode=False):
+def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, transfer_manifest, test_mode=False):
     src_files = parse_manifest(source_prefix, source_manifest, "Source")
 
     generate_file_listing(dest_prefix, "destination_manifest.txt")
     dest_files = parse_manifest(dest_prefix, "destination_manifest.txt", "Destination")
 
-    src_files_set = set(src_files)
-    dest_files_set = set(dest_files)
-    files_to_xfer = src_files_set - dest_files_set
+    files_to_xfer = set()
+    for fname in src_files:
+        if src_files[fname] != dest_files.get(dest_files, -1):
+            files_to_xfer.add(fname)
+
+    transfer_manifest = os.path.join(dest_prefix, "transfer_manifest.txt")
+    if not os.path.exists(transfer_manifest):
+        with open(transfer_manifest, "w") as fp:
+            pass
+
+    files_verified = set()
+    with open(transfer_manifest, "r") as fp:
+        for line in fp.readlines():
+            info = line.strip().split()
+            if info != 'TRANSFER_VERIFIED':
+                continue
+            if len(info) != 4:
+                continue
+            fname, hexdigest, size = info[1:]
+            if !fname.startswith(source_prefix):
+                logging.warning("Incorrect source prefix in transfer_manifest.txt; filename %s", fname)
+                sys.exit(3)
+            relative_fname = fname[len(source_prefix) + 1:]
+            files_verified.add(realtive_fname)
+
+    files_to_verify = set()
+    for fname in src_files:
+        if fname in files_to_xfer:
+            continue
+        if fname not in files_verified:
+            files_to_verify.add(fname)
 
     info = os.path.split(sys.argv[0])
     full_exec_path = os.path.join(os.path.abspath(info[0]), info[1])
 
     with open("xfer_file.sub", "w") as fp:
         fp.write(XFER_FILE_JOB.format(full_exec_path))
+    with open("verify_file.sub", "w") as fp:
+        fp.write(VERIFY_FILE_JOB.format(full_exec_path))
 
     idx = 0
     dest_dirs = set()
@@ -234,8 +294,19 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tes
             dest = os.path.join(dest_prefix, fname)
             dest_dirs.add(os.path.split(dest)[0])
             logging.info("File transfer to perform: %s->%s", src_file, dest)
-            fp.write(DO_WORK_DAG_SNIPPET.format(name=idx, src_file=src_file,
-                xfer_py=full_exec_path, src_file_noslash=src_file_noslash, dest=dest))
+            fp.write(DO_WORK_DAG_XFER_SNIPPET.format(name=idx, src_file=src_file,
+                xfer_py=full_exec_path, src_file_noslash=src_file_noslash, dest=dest,
+                transfer_manifest=transfer_manifest))
+
+        idx = 0
+        for fname in files_to_verify:
+            idx += 1
+            src_file = os.path.join(source_prefix, fname)
+            src_file_noslash = fname.replace("/", "_")
+            logging.info("File to verify: %s", src_file)
+            fp.write(DO_WORK_DAG_VERIFY_SNIPPET.format(name=idx, src_file=src_file,
+                xfer_py=full_exec_path, src_file_noslash=src_file_noslash, dest=dest,
+                transfer_manifest=transfer_manifest))
 
     for dest_dir in dest_dirs:
         try:
@@ -246,8 +317,6 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tes
 
 
 def xfer_exec(src):
-    logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
-
     if '_CONDOR_JOB_AD' not in os.environ:
         print("This executable must be run within the HTCondor runtime environment.")
         sys.exit(1)
@@ -277,6 +346,37 @@ def xfer_exec(src):
     os.fsync(dest_fd.fileno())
     logging.info("File synchronized to disk")
     dest_fd.close()
+
+    logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
+    with open("metadata", "w") as metadata_fd:
+        metadata_fd.write("{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode('utf-8'))
+
+
+def verify_remote(src):
+    if '_CONDOR_JOB_AD' not in os.environ:
+        print("This executable must be run within the HTCondor runtime environment.")
+        sys.exit(1)
+
+    logging.info("About to verify %s", src)
+    src_fd = open(src, "r")
+    file_size = os.fstat(src_fd.fileno()).st_size
+    logging.info("There are %.2fMB to verify", file_size / 1024. / 1024.)
+    last_log = time.time()
+    buf = src_fd.read(1024*1024)
+    hash_obj = hashlib.sha1()
+    byte_count = len(buf)
+    while len(buf) > 0:
+        hash_obj.update(buf)
+        buf = src_fd.read(1024*1024)
+        now = time.time()
+        if (now - last_log > 5):
+            logging.info("Copied %.2f of %.2fMB; %.1f%% done", byte_count / 1024. / 1024., file_size / 1024. / 1024.,
+                (byte_count / float(file_size)) * 100)
+            last_log = now
+        byte_count += len(buf)
+
+    src_fd.close()
+    logging.info("Checksum computation complete")
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
     with open("metadata", "w") as metadata_fd:
@@ -328,7 +428,7 @@ def verify(dest, metadata, metadata_summary):
             " SHA1 digest (%s)", dest, src_fname, src_hexdigest)
 
     with open(metadata_summary, "a") as md_fd:
-        md_fd.write("{} {} {}\n".format(src_fname, src_hexdigest, src_size).encode('utf-8'))
+        md_fd.write("TRANSFER_VERIFIED {} {} {}\n".format(src_fname, src_hexdigest, src_size).encode('utf-8'))
         os.fsync(md_fd.fileno())
 
 
@@ -347,11 +447,13 @@ def main():
         generate_file_listing(args.src, "source_manifest.txt", test_mode=args.test_mode)
     elif args.cmd == "write_subdag":
         logging.info("Generating SUBGDAG for transfer of %s->%s", args.source_prefix, args.dest_prefix)
-        write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, test_mode=args.test_mode)
+        write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, args.transfer_manifest, test_mode=args.test_mode)
     elif args.cmd == "exec":
         xfer_exec(args.src)
     elif args.cmd == "verify":
         verify(args.dest, args.metadata, args.metadata_summary)
+    elif args.cmd == "verify_remote":
+        verify_remote(args.src)
 
 if __name__ == '__main__':
     main()
