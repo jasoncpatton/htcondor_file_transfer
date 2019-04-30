@@ -58,6 +58,7 @@ arguments = exec $(src_file)
 should_transfer_files = YES
 transfer_output_files = file0, metadata
 transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).metadata"
++IS_TRANSFER_JOB = true
 
 queue
 """
@@ -73,6 +74,7 @@ arguments = verify_remote $(src_file)
 should_transfer_files = YES
 transfer_output_files = metadata
 transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
++IS_TRANSFER_JOB = true
 
 queue
 """
