@@ -28,6 +28,7 @@ JOB CalculateWork calc_work.sub DIR calc_work
 SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {other_args}
 
 SUBDAG EXTERNAL DoXfers calc_work/do_work.dag
+SCRIPT POST DoXfers {exec_py} analyze {transfer_manifest}
 
 PARENT CalculateWork CHILD DoXfers
 """
@@ -61,7 +62,7 @@ transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).me
 queue
 """
 
-XFER_VERIFY_JOB = \
+VERIFY_FILE_JOB = \
 """
 universe = vanilla
 executable = {}
@@ -89,7 +90,7 @@ JOB xfer_{name} xfer_file.sub DIR calc_work
 VARS xfer_{name} src_file_noslash="{src_file_noslash}"
 VARS xfer_{name} src_file="{src_file}"
 VARS xfer_{name} dst_file="{dest}"
-SCRIPT POST xfer_{name} {xfer_py} verify {dest} {src_file_noslash}.metadata {transfer_manifest}
+SCRIPT POST xfer_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
 
 """
 
@@ -99,7 +100,7 @@ JOB verify_{name} verify_file.sub DIR calc_work
 VARS verify_{name} src_file_noslash="{src_file_noslash}"
 VARS verify_{name} src_file="{src_file}"
 VARS verify_{name} dst_file="{dest}"
-SCRIPT POST verify_{name} {xfer_py} verify {dest} {src_file_noslash}.metadata {transfer_manifest}
+SCRIPT POST verify_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
 
 """
 
@@ -143,9 +144,13 @@ def parse_args():
     parser_verify_remote.add_argument("src")
 
     parser_verify = subparsers.add_parser("verify")
+    parser_verify.add_argument("dest_prefix")
     parser_verify.add_argument("dest")
     parser_verify.add_argument("metadata")
     parser_verify.add_argument("metadata_summary")
+
+    parser_analyze = subparsers.add_parser("analyze")
+    parser_analyze.add_argument("transfer_manifest")
  
     return parser.parse_args()
 
@@ -207,6 +212,7 @@ def submit_parent_dag(working_dir, source_dir, dest_dir, test_mode=False):
 
     orig_pwd = os.getcwd()
     try:
+        os.chdir(working_dir)
         sub = htcondor.Submit(submit_dict)
         with schedd.transaction() as txn:
             return sub.queue(txn)
@@ -243,13 +249,18 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
 
     files_to_xfer = set()
     for fname in src_files:
-        if src_files[fname] != dest_files.get(dest_files, -1):
+        if src_files[fname] != dest_files.get(fname, -1):
             files_to_xfer.add(fname)
 
     transfer_manifest = os.path.join(dest_prefix, "transfer_manifest.txt")
     if not os.path.exists(transfer_manifest):
-        with open(transfer_manifest, "w") as fp:
-            pass
+        try:
+            os.makedirs(dest_prefix)
+        except OSError as oe:
+            if oe.errno != errno.EEXIST:
+                raise
+        fd = os.open(transfer_manifest, os.O_CREAT|os.O_RDONLY)
+        os.close(fd)
 
     files_verified = set()
     with open(transfer_manifest, "r") as fp:
@@ -257,12 +268,9 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             info = line.strip().split()
             if info != 'TRANSFER_VERIFIED':
                 continue
-            if len(info) != 4:
+            if len(info) != 5:
                 continue
             fname, hexdigest, size = info[1:]
-            if !fname.startswith(source_prefix):
-                logging.warning("Incorrect source prefix in transfer_manifest.txt; filename %s", fname)
-                sys.exit(3)
             relative_fname = fname[len(source_prefix) + 1:]
             files_verified.add(realtive_fname)
 
@@ -296,17 +304,18 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             logging.info("File transfer to perform: %s->%s", src_file, dest)
             fp.write(DO_WORK_DAG_XFER_SNIPPET.format(name=idx, src_file=src_file,
                 xfer_py=full_exec_path, src_file_noslash=src_file_noslash, dest=dest,
-                transfer_manifest=transfer_manifest))
+                transfer_manifest=transfer_manifest, dest_prefix=dest_prefix))
 
         idx = 0
         for fname in files_to_verify:
             idx += 1
             src_file = os.path.join(source_prefix, fname)
             src_file_noslash = fname.replace("/", "_")
+            dest = os.path.join(dest_prefix, fname)
             logging.info("File to verify: %s", src_file)
             fp.write(DO_WORK_DAG_VERIFY_SNIPPET.format(name=idx, src_file=src_file,
                 xfer_py=full_exec_path, src_file_noslash=src_file_noslash, dest=dest,
-                transfer_manifest=transfer_manifest))
+                transfer_manifest=transfer_manifest, dest_prefix=dest_prefix))
 
     for dest_dir in dest_dirs:
         try:
@@ -314,6 +323,16 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
         except OSError as oe:
             if oe.errno != errno.EEXIST:
                 raise
+
+    bytes_to_transfer = sum(src_files[fname] for fname in files_to_xfer)
+    bytes_to_verify = sum(src_files[fname] for fname in files_to_verify)
+    with open(transfer_manifest, "a") as fp:
+        fp.write("SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}\n".format(
+            source_prefix, len(src_files), len(files_to_xfer), bytes_to_transfer, len(files_to_verify), bytes_to_verify, time.time()))
+        for fname in files_to_xfer:
+            fp.write("TRANSFER_REQUEST {} {}\n".format(fname, src_files[fname]))
+        for fname in files_to_verify:
+            fp.write("VERIFY_REQUEST {} {}\n".format(fname, src_files[fname]))
 
 
 def xfer_exec(src):
@@ -383,7 +402,7 @@ def verify_remote(src):
         metadata_fd.write("{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode('utf-8'))
 
 
-def verify(dest, metadata, metadata_summary):
+def verify(dest_prefix, dest, metadata, metadata_summary):
     with open(metadata, "r") as metadata_fd:
         if os.fstat(metadata_fd.fileno()).st_size > 16384:
             logging.error("Metadata file is too large")
@@ -396,6 +415,8 @@ def verify(dest, metadata, metadata_summary):
         src_fname = info[0].decode('utf-8')
         src_hexdigest = info[1]
         src_size = int(info[2])
+
+    relative_fname = dest[len(dest_prefix) + 1:]
 
     logging.info("About to verify contents of %s", dest)
     dest_fd = open(dest, "r")
@@ -428,8 +449,94 @@ def verify(dest, metadata, metadata_summary):
             " SHA1 digest (%s)", dest, src_fname, src_hexdigest)
 
     with open(metadata_summary, "a") as md_fd:
-        md_fd.write("TRANSFER_VERIFIED {} {} {}\n".format(src_fname, src_hexdigest, src_size).encode('utf-8'))
+        md_fd.write("TRANSFER_VERIFIED {} {} {} {}\n".format(relative_fname, src_hexdigest, src_size, int(time.time())).encode('utf-8'))
         os.fsync(md_fd.fileno())
+
+
+def analyze(transfer_manifest):
+    sync_request_start = None
+    idx = -1
+    sync_request = {'files': {}, 'xfer_files': set()}
+    dest_dir = os.path.abspath(os.path.split(transfer_manifest)[0])
+    sync_count = 0
+
+    with open(transfer_manifest, "r") as fp:
+        idx += 1
+        for line in fp.xreadlines():
+            info = line.strip().split()
+            # Format: SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}
+            if info[0] == 'SYNC_REQUEST':
+                sync_count += 1
+                if sync_request_start is not None:
+                    logging.error("Sync request started at line %d but never finished; inconsistent log",
+                        sync_request_start)
+                    sys.exit(4)
+                sync_request_start = idx
+                for entry in info[2:]:
+                    key, val = entry.split("=")
+                    if key == 'timestamp':
+                        continue
+                    sync_request[key] = int(val)
+            elif info[0] == 'TRANSFER_REQUEST' or info[0] == 'VERIFY_REQUEST': # Format: TRANSFER_REQUEST fname size
+                if sync_request_start is None:
+                    logging.error("Transfer request found at line %d before sync started; inconsistent log", idx)
+                    sys.exit(4)
+                sync_request['files'][info[1]] = int(info[2])
+                if info[0] == 'TRANSFER_REQUEST':
+                    sync_request['xfer_files'].add(info[1])
+            elif info[0] == 'TRANSFER_VERIFIED':
+                if sync_request_start is None:
+                    logging.error("Transfer verification found at line %d before sync started; inconsistent log", idx)
+                    sys.exit(4)
+                fname = info[1]
+                size = int(info[3])
+                if fname not in sync_request['files']:
+                    logging.error("File %s verified but was not requested.", fname)
+                    sys.exit(4)
+                if sync_request['files'][fname] != size:
+                    logging.error("Verified file size %d of %s is different than anticipated", size, fname, sync_request['files'][fname])
+                    sys.exit(4)
+                try:
+                    local_size = os.stat(os.path.join(dest_dir, fname)).st_size
+                except OSError as oe:
+                    logging.error("Unable to verify size of %s: %s", fname, str(oe))
+                    sys.exit(4)
+                if local_size != size:
+                    logging.error("Local size of %d of %s does not match anticipated size %d.", local_size, fname, size)
+                    sys.exit(4)
+                if fname in sync_request['xfer_files']:
+                    sync_request['files_to_transfer'] -= 1
+                    sync_request['bytes_to_transfer'] -= size
+                else:
+                    sync_request['files_to_verify'] -= 1
+                    sync_request['bytes_to_verify'] -= size
+                del sync_request['files'][fname]
+            elif info[0] == 'SYNC_DONE':
+                if sync_request_start is None:
+                    logging.error("Transfer request found at line %d before sync started; inconsistent log", idx)
+                    sys.exit(4)
+
+                if sync_request['files_to_verify'] or sync_request['bytes_to_verify'] or sync_request['files'] or \
+                        sync_request['files_to_transfer'] or sync_request['bytes_to_transfer']:
+                    logging.error("SYNC_DONE but there is work remaining: %s", str(sync_request))
+                    sys.exit(4)
+                sync_request_start = None
+                sync_request = {'files': {}, 'xfer_files': set()}
+        if sync_request_start is not None and (sync_request['files_to_verify'] or sync_request['bytes_to_verify'] or sync_request['files'] or \
+                sync_request['files_to_transfer'] or sync_request['bytes_to_transfer']):
+            logging.error("Sync not done! Work remaining.")
+            logging.error("- Files to transfer: %s", sync_request['files_to_transfer'])
+            logging.error("- Files to verify: %s", sync_request['files_to_verify'])
+            sys.exit(4)
+    if sync_request_start is not None:
+        with open(transfer_manifest, "w") as fp:
+            fp.write("SYNC_DONE {}".format(int(time.time())))
+        print("Synchronization done; verification complete.")
+    elif sync_count:
+        print("All synchronizations done; verification complete")
+    else:
+        logging.error("No synchronization found in manifest.")
+        sys.exit(1)
 
 
 def main():
@@ -439,7 +546,7 @@ def main():
 
     if args.cmd == "sync":
         working_dir = args.working_dir if args.working_dir else os.getcwd()
-        print("Will transfer %s at source to %s at destination" % (args.src, args.dest))
+        print("Will synchronize %s at source to %s at destination" % (args.src, args.dest))
         cluster_id = submit_parent_dag(working_dir, args.src, os.path.abspath(args.dest), test_mode=args.test_mode)
         print("Parent job running in cluster %d" % cluster_id)
     elif args.cmd == "generate":
@@ -451,9 +558,11 @@ def main():
     elif args.cmd == "exec":
         xfer_exec(args.src)
     elif args.cmd == "verify":
-        verify(args.dest, args.metadata, args.metadata_summary)
+        verify(args.dest_prefix, args.dest, args.metadata, args.metadata_summary)
     elif args.cmd == "verify_remote":
         verify_remote(args.src)
+    elif args.cmd == "analyze":
+        analyze(args.transfer_manifest)
 
 if __name__ == '__main__':
     main()
