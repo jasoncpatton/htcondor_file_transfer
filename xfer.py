@@ -43,6 +43,8 @@ log = calc_work.log
 arguments = generate {source_dir} {other_args}
 should_transfer_files = YES
 transfer_output_files = source_manifest.txt
+requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
++IS_TRANSFER_JOB = true
 
 queue
 """
@@ -58,6 +60,8 @@ arguments = exec $(src_file)
 should_transfer_files = YES
 transfer_output_files = file0, metadata
 transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).metadata"
+requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
++IS_TRANSFER_JOB = true
 
 queue
 """
@@ -73,6 +77,8 @@ arguments = verify_remote $(src_file)
 should_transfer_files = YES
 transfer_output_files = metadata
 transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
+requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
++IS_TRANSFER_JOB = true
 
 queue
 """
