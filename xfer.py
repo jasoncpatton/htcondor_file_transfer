@@ -536,7 +536,7 @@ def analyze(transfer_manifest):
             sys.exit(4)
     if sync_request_start is not None:
         with open(transfer_manifest, "a") as fp:
-            fp.write("SYNC_DONE {}".format(int(time.time())))
+            fp.write("SYNC_DONE {}\n".format(int(time.time())))
         print("Synchronization done; verification complete.")
     elif sync_count:
         print("All synchronizations done; verification complete")
