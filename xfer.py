@@ -535,7 +535,7 @@ def analyze(transfer_manifest):
             logging.error("- Files to verify: %s", sync_request['files_to_verify'])
             sys.exit(4)
     if sync_request_start is not None:
-        with open(transfer_manifest, "w") as fp:
+        with open(transfer_manifest, "a") as fp:
             fp.write("SYNC_DONE {}".format(int(time.time())))
         print("Synchronization done; verification complete.")
     elif sync_count:
