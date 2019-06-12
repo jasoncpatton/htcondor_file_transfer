@@ -12,7 +12,9 @@ import errno
 import hashlib
 import logging
 import os
+import re
 import sys
+import json
 import time
 
 import htcondor
@@ -45,6 +47,7 @@ should_transfer_files = YES
 transfer_output_files = source_manifest.txt
 requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
 +IS_TRANSFER_JOB = true
++WantFlocking = true
 
 queue
 """
@@ -62,6 +65,7 @@ transfer_output_files = file0, metadata
 transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).metadata"
 requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
 +IS_TRANSFER_JOB = true
++WantFlocking = true
 
 queue
 """
@@ -79,6 +83,7 @@ transfer_output_files = metadata
 transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
 requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
 +IS_TRANSFER_JOB = true
++WantFlocking = true
 
 queue
 """
@@ -109,6 +114,12 @@ VARS verify_{name} dst_file="{dest}"
 SCRIPT POST verify_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
 
 """
+
+
+_SIMPLE_FNAME_RE = re.compile("^[0-9A-Za-z_./\-]+$")
+def simple_fname(fname):
+    return _SIMPLE_FNAME_RE.matches(fname)
+
 
 def search_path(exec_name):
     for path in os.environ.get("PATH", "/usr/bin:/bin").split(":"):
@@ -169,7 +180,11 @@ def generate_file_listing(src, manifest, test_mode=False):
                 size = os.stat(full_fname).st_size
                 if test_mode and size > 50*1024*1024:
                     continue
-                fp.write("{} {}\n".format(full_fname, size))
+                if simple_fname(full_fname):
+                    fp.write("{} {}\n".format(full_fname, size))
+                else:
+                    info = {'name': full_fname, 'size': size}
+                    fp.write("{}\n".format(json.dumps(info)))
 
 
 def submit_parent_dag(working_dir, source_dir, dest_dir, test_mode=False):
@@ -232,11 +247,23 @@ def parse_manifest(prefix, manifest, log_name):
     files = {}
     with open(manifest, "r") as fd:
         for line in fd.readlines():
-            info = line.strip().split()
-            if len(info) != 2:
-                raise Exception("Manifest lines must have two columns")
-            fname = info[0].decode('utf-8')
-            size = int(info[1])
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswitch("{"):
+                info = json.loads(line)
+                if 'name' not in info:
+                    raise Exception("Manifest line missing 'name' key.  Current line: %s" % line)
+                fname = info['name']
+                if 'size' not in info:
+                    raise Exception("Manifest line missing 'size' key.  Currenty line: %s" % line)
+                size = int(info['size'])
+            else:
+                info = line.strip().split()
+                if len(info) != 2:
+                    raise Exception("Manifest lines must have two columns.  Current line: %s" % line)
+                fname = info[0].decode('utf-8')
+                size = int(info[1])
             if not fname.startswith(prefix):
                 logging.error("%s file (%s) does not start with specified prefix", log_name, fname)
             fname = fname[len(prefix) + 1:]
@@ -271,12 +298,20 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
     files_verified = set()
     with open(transfer_manifest, "r") as fp:
         for line in fp.readlines():
+            line = line.strip()
+            if not line or line[0] == '#':
+                continue
             info = line.strip().split()
             if info[0] != 'TRANSFER_VERIFIED':
                 continue
-            if len(info) != 5:
-                continue
-            fname, hexdigest, size = info[1:-1]
+                if info[1] == '{':
+                    info = json.loads(info[1])
+                    if 'name' not in info or 'digest' not in info or \
+                            'size' not in info:
+                        continue
+                if len(info) != 5:
+                    continue
+                fname, hexdigest, size = info[1:-1]
             relative_fname = fname
             files_verified.add(relative_fname)
 
@@ -336,9 +371,17 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
         fp.write("SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}\n".format(
             source_prefix, len(src_files), len(files_to_xfer), bytes_to_transfer, len(files_to_verify), bytes_to_verify, time.time()))
         for fname in files_to_xfer:
-            fp.write("TRANSFER_REQUEST {} {}\n".format(fname, src_files[fname]))
+            if simple_fname(fname):
+                fp.write("TRANSFER_REQUEST {} {}\n".format(fname, src_files[fname]))
+            else:
+                info = {"name": fname, "size": src_files[fname]}
+                fp.write("TRANSFER_REQUEST {}\n".format(json.dumps(info)))
         for fname in files_to_verify:
-            fp.write("VERIFY_REQUEST {} {}\n".format(fname, src_files[fname]))
+            if simple_fname(fname):
+                fp.write("VERIFY_REQUEST {} {}\n".format(fname, src_files[fname]))
+            else:
+                info = {"name": fname, "size": src_files[fname]}
+                fp.write("VERIFY_REQUEST {}\n".format(json.dumps(info)))
 
 
 def xfer_exec(src):
@@ -374,7 +417,11 @@ def xfer_exec(src):
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
     with open("metadata", "w") as metadata_fd:
-        metadata_fd.write("{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode('utf-8'))
+        if simple_fname(src):
+            metadata_fd.write("{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode('utf-8'))
+        else:
+            info = {"name": src, "digest": hash_obj.hexdigest(), "size": byte_count}
+            metadata_fd.write("{}\n".format(json.dumps(info)))
 
 
 def verify_remote(src):
@@ -405,7 +452,11 @@ def verify_remote(src):
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
     with open("metadata", "w") as metadata_fd:
-        metadata_fd.write("{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode('utf-8'))
+        if simple_fname(src):
+            metadata_fd.write("{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode('utf-8'))
+        else:
+            info = {"name": src, "digest": hash_obj.hexdigest(), "size": byte_count}
+            metadata_fd.write("{}\n".format(json.dumps(info)))
 
 
 def verify(dest_prefix, dest, metadata, metadata_summary):
@@ -414,13 +465,26 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
             logging.error("Metadata file is too large")
             sys.exit(1)
         contents = metadata_fd.read()
-        info = contents.strip().split()
-        if len(info) != 3:
-            logging.error("Metadata file format incorrect")
+        contents = contents.strip()
+        if not contents:
+            logging.error("Metadata file is empty")
             sys.exit(1)
-        src_fname = info[0].decode('utf-8')
-        src_hexdigest = info[1]
-        src_size = int(info[2])
+        if info[0] == '{':
+            info = json.loads(contents)
+            if 'name' not in info or 'digest' not in info or 'size' not in info:
+                logging.error("Metadata file format incorrect; missing keys")
+                sys.exit(1)
+            src_fname = info['name']
+            src_hexdigest = info['digest'].encode("ascii")
+            src_size = int(info['size'])
+        else:
+            info = contents.strip().split()
+            if len(info) != 3:
+                logging.error("Metadata file format incorrect")
+                sys.exit(1)
+            src_fname = info[0].decode('utf-8')
+            src_hexdigest = info[1]
+            src_size = int(info[2])
 
     relative_fname = dest[len(dest_prefix) + 1:]
 
@@ -455,7 +519,11 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
             " SHA1 digest (%s)", dest, src_fname, src_hexdigest)
 
     with open(metadata_summary, "a") as md_fd:
-        md_fd.write("TRANSFER_VERIFIED {} {} {} {}\n".format(relative_fname, src_hexdigest, src_size, int(time.time())).encode('utf-8'))
+        if simple_fname(relative_fname):
+            md_fd.write("TRANSFER_VERIFIED {} {} {} {}\n".format(relative_fname, src_hexdigest, src_size, int(time.time())).encode('utf-8'))
+        else:
+            info = {"name": relative_fname, "digest": src_hexdigest, "size": src_size, "timestamp": int(time.time())}
+            md_fd.write("TRANSFER_VERIFIED {}\n".format(json.dumps(info)))
         os.fsync(md_fd.fileno())
 
 
@@ -487,15 +555,28 @@ def analyze(transfer_manifest):
                 if sync_request_start is None:
                     logging.error("Transfer request found at line %d before sync started; inconsistent log", idx)
                     sys.exit(4)
-                sync_request['files'][info[1]] = int(info[2])
+                if info[1][0] == '{':
+                    local_info = json.loads(info[1])
+                    sync_request['files'][local_info['name']] = int(local_info['size'])
+                else:
+                    sync_request['files'][info[1]] = int(info[2])
                 if info[0] == 'TRANSFER_REQUEST':
-                    sync_request['xfer_files'].add(info[1])
-            elif info[0] == 'TRANSFER_VERIFIED':
+                    if info[1][0] == '{':
+                        local_info = json.loads(info[1])
+                        sync_request['xfer_files'].add(local_info['name'])
+                    else:
+                        sync_request['xfer_files'].add(info[1])
+            elif info[0] == 'TRANSFER_VERIFIED': # Format: TRANSFER_VERIFIED relative_fname hexdigest size timestamp:
                 if sync_request_start is None:
                     logging.error("Transfer verification found at line %d before sync started; inconsistent log", idx)
                     sys.exit(4)
-                fname = info[1]
-                size = int(info[3])
+                if info[1][0] == '{':
+                    local_info = json.loads(info[1])
+                    fname = local_info['name']
+                    size = int(local_info['size'])
+                else:
+                    fname = info[1]
+                    size = int(info[3])
                 if fname not in sync_request['files']:
                     logging.error("File %s verified but was not requested.", fname)
                     sys.exit(4)
