@@ -272,13 +272,13 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
     with open(transfer_manifest, "r") as fp:
         for line in fp.readlines():
             info = line.strip().split()
-            if info != 'TRANSFER_VERIFIED':
+            if info[0] != 'TRANSFER_VERIFIED':
                 continue
             if len(info) != 5:
                 continue
-            fname, hexdigest, size = info[1:]
-            relative_fname = fname[len(source_prefix) + 1:]
-            files_verified.add(realtive_fname)
+            fname, hexdigest, size = info[1:-1]
+            relative_fname = fname
+            files_verified.add(relative_fname)
 
     files_to_verify = set()
     for fname in src_files:
