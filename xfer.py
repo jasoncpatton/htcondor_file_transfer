@@ -48,6 +48,7 @@ transfer_output_files = source_manifest.txt
 requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
 +IS_TRANSFER_JOB = true
 +WantFlocking = true
+keep_claim_idle = 300
 
 queue
 """
@@ -116,9 +117,9 @@ SCRIPT POST verify_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslas
 """
 
 
-_SIMPLE_FNAME_RE = re.compile("^[0-9A-Za-z_./\-]+$")
+_SIMPLE_FNAME_RE = re.compile("^[0-9A-Za-z_./:\-]+$")
 def simple_fname(fname):
-    return _SIMPLE_FNAME_RE.matches(fname)
+    return _SIMPLE_FNAME_RE.match(fname)
 
 
 def search_path(exec_name):
@@ -250,7 +251,7 @@ def parse_manifest(prefix, manifest, log_name):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if line.startswitch("{"):
+            if line.startswith("{"):
                 info = json.loads(line)
                 if 'name' not in info:
                     raise Exception("Manifest line missing 'name' key.  Current line: %s" % line)
@@ -469,7 +470,7 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
         if not contents:
             logging.error("Metadata file is empty")
             sys.exit(1)
-        if info[0] == '{':
+        if contents[0] == '{':
             info = json.loads(contents)
             if 'name' not in info or 'digest' not in info or 'size' not in info:
                 logging.error("Metadata file format incorrect; missing keys")
@@ -525,6 +526,15 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
             info = {"name": relative_fname, "digest": src_hexdigest, "size": src_size, "timestamp": int(time.time())}
             md_fd.write("TRANSFER_VERIFIED {}\n".format(json.dumps(info)))
         os.fsync(md_fd.fileno())
+
+    os.unlink(metadata)
+    if metadata.endswith(".metadata"):
+        out_file = metadata[:-8] + "out"
+        if os.path.exists(out_file):
+            os.unlink(out_file)
+        err_file = metadata[:-8] + "err"
+        if os.path.exists(err_file):
+            os.unlink(err_file)
 
 
 def analyze(transfer_manifest):
