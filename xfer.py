@@ -60,7 +60,7 @@ executable = {}
 output = $(src_file_noslash).out
 error = $(src_file_noslash).err
 log = xfer_file.log
-arguments = exec $(src_file)
+Args = "exec '$(src_file)'"
 should_transfer_files = YES
 transfer_output_files = file0, metadata
 transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).metadata"
@@ -78,7 +78,7 @@ executable = {}
 output = $(src_file_noslash).out
 error = $(src_file_noslash).err
 log = xfer_file.log
-arguments = verify_remote $(src_file)
+Args = "verify_remote '$(src_file)'"
 should_transfer_files = YES
 transfer_output_files = metadata
 transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
