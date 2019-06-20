@@ -102,7 +102,8 @@ JOB xfer_{name} xfer_file.sub DIR calc_work
 VARS xfer_{name} src_file_noslash="{src_file_noslash}"
 VARS xfer_{name} src_file="{src_file}"
 VARS xfer_{name} dst_file="{dest}"
-SCRIPT POST xfer_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
+# SCRIPT POST xfer_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
+SCRIPT POST xfer_{name} {xfer_py} verify --json=xfer_commands_{fileidx}.json --fileid={name}
 
 """
 
@@ -112,7 +113,8 @@ JOB verify_{name} verify_file.sub DIR calc_work
 VARS verify_{name} src_file_noslash="{src_file_noslash}"
 VARS verify_{name} src_file="{src_file}"
 VARS verify_{name} dst_file="{dest}"
-SCRIPT POST verify_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
+# SCRIPT POST verify_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
+SCRIPT POST verify_{name} {xfer_py} verify --json=xfer_commands_{fileidx}.json --fileid={name}
 
 """
 
@@ -162,10 +164,13 @@ def parse_args():
     parser_verify_remote.add_argument("src")
 
     parser_verify = subparsers.add_parser("verify")
-    parser_verify.add_argument("dest_prefix")
-    parser_verify.add_argument("dest")
-    parser_verify.add_argument("metadata")
-    parser_verify.add_argument("metadata_summary")
+    # SCRIPT POST xfer_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
+    #parser_verify.add_argument("dest_prefix")
+    #parser_verify.add_argument("dest")
+    #parser_verify.add_argument("metadata")
+    #parser_verify.add_argument("metadata_summary")
+    parser_verify.add_argument("--json", dest="json")
+    parser_verify.add_argument("--fileid", dest="fileid")
 
     parser_analyze = subparsers.add_parser("analyze")
     parser_analyze.add_argument("transfer_manifest")
@@ -333,6 +338,8 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
 
     idx = 0
     dest_dirs = set()
+    jsonidx = 0
+    cmd_info = {}
     with open("do_work.dag", "w") as fp:
         fp.write(DO_WORK_DAG_HEADER.format("MAXJOBS TRANSFER_JOBS 1" if test_mode else ""))
         files_to_xfer = list(files_to_xfer)
@@ -343,10 +350,24 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             src_file_noslash = fname.replace("/", "_")
             dest = os.path.join(dest_prefix, fname)
             dest_dirs.add(os.path.split(dest)[0])
+
             logging.info("File transfer to perform: %s->%s", src_file, dest)
-            fp.write(DO_WORK_DAG_XFER_SNIPPET.format(name=idx, src_file=src_file,
-                xfer_py=full_exec_path, src_file_noslash=src_file_noslash, dest=dest,
-                transfer_manifest=transfer_manifest, dest_prefix=dest_prefix))
+            cur_jsonidx = idx / 1000
+            if jsonidx != cur_jsonidx:
+                # xfer_commands_{fileidx}.json
+                with open("xfer_commands_{}.json".format(jsonidx), "w") as cmd_fp:
+                    json.dump(cmd_info, cmd_fp)
+                jsonidx = cur_jsonidx
+                cmd_info = {}
+            cmd_info[str(idx)] = {
+                "src_file": src_file,
+                "src_file_noslash": src_file_noslash,
+                "dest": dest,
+                "transfer_manifest": transfer_manifest,
+                "dest_prefix": dest_prefix
+            }
+            fp.write(DO_WORK_DAG_XFER_SNIPPET.format(name=idx, fileidx=cur_jsonidx,
+                xfer_py=full_exec_path))
 
         idx = 0
         for fname in files_to_verify:
@@ -355,9 +376,24 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             src_file_noslash = fname.replace("/", "_")
             dest = os.path.join(dest_prefix, fname)
             logging.info("File to verify: %s", src_file)
-            fp.write(DO_WORK_DAG_VERIFY_SNIPPET.format(name=idx, src_file=src_file,
-                xfer_py=full_exec_path, src_file_noslash=src_file_noslash, dest=dest,
-                transfer_manifest=transfer_manifest, dest_prefix=dest_prefix))
+            cur_jsonidx = idx / 1000
+            if jsonidx != cur_jsonidx:
+                with open("xfer_commands_{}.json".format(jsonidx), "w") as cmd_fp:
+                    json.dump(cmd_info, cmd_fp)
+                jsonidx = cur_jsonidx
+                cmd_info = {}
+            cmd_info[str(idx)] = {
+                "src_file": src_file,
+                "src_file_noslash": src_file_noslash,
+                "dest": dest,
+                "transfer_manifest": transfer_manifest,
+                "dest_prefix": dest_prefix
+            }
+            fp.write(DO_WORK_DAG_VERIFY_SNIPPET.format(name=idx, fileidx=cur_jsonidx,
+                xfer_py=full_exec_path))
+
+        with open("xfer_commands_{}.json".format(cur_jsonidx), "w") as cmd_fp:
+            json.dump(cmd_info, cmd_fp)
 
     for dest_dir in dest_dirs:
         try:
@@ -655,7 +691,10 @@ def main():
     elif args.cmd == "exec":
         xfer_exec(args.src)
     elif args.cmd == "verify":
-        verify(args.dest_prefix, args.dest, args.metadata, args.metadata_summary)
+        with open(args.json, "r") as fp:
+            cmd_info = json.load(fp)
+        info = cmd_info[args.fileid]
+        verify(info['dest_prefix'], info['dest'], '{}.metadata'.format(info['src_file_noslash']), info['transfer_manifest'])
     elif args.cmd == "verify_remote":
         verify_remote(args.src)
     elif args.cmd == "analyze":
