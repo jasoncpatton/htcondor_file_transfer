@@ -71,6 +71,24 @@ requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
 queue
 """
 
+XFER_FILE_N_JOB = \
+"""
+universe = vanilla
+executable = {xfer_py}
+output = $(name).out
+error = $(name).err
+log = xfer_file.log
+Args = "exec_n --json '$(name)'"
+should_transfer_files = YES
+transfer_output_files = {file_list}, metadata
+transfer_output_remaps = "{file_list}; metadata = result_$(name).metadata"
+requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
++IS_TRANSFER_JOB = true
++WantFlocking = true
+
+queue
+"""
+
 VERIFY_FILE_JOB = \
 """
 universe = vanilla
@@ -102,7 +120,6 @@ JOB xfer_{name} xfer_file.sub DIR calc_work
 VARS xfer_{name} src_file_noslash="{src_file_noslash}"
 VARS xfer_{name} src_file="{src_file}"
 VARS xfer_{name} dst_file="{dest}"
-# SCRIPT POST xfer_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
 SCRIPT POST xfer_{name} {xfer_py} verify --json=xfer_commands_{fileidx}.json --fileid={name}
 
 """
@@ -113,8 +130,7 @@ JOB verify_{name} verify_file.sub DIR calc_work
 VARS verify_{name} src_file_noslash="{src_file_noslash}"
 VARS verify_{name} src_file="{src_file}"
 VARS verify_{name} dst_file="{dest}"
-# SCRIPT POST verify_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
-SCRIPT POST verify_{name} {xfer_py} verify --json=xfer_commands_{fileidx}.json --fileid={name}
+SCRIPT POST verify_{name} {xfer_py} verify --json=verify_commands_{fileidx}.json --fileid={name}
 
 """
 
@@ -367,7 +383,11 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
                 "dest_prefix": dest_prefix
             }
             fp.write(DO_WORK_DAG_XFER_SNIPPET.format(name=idx, fileidx=cur_jsonidx,
-                xfer_py=full_exec_path))
+                xfer_py=full_exec_path, src_file=src_file, src_file_noslash=src_file_noslash,
+		dest=dest))
+
+        with open("xfer_commands_{}.json".format(cur_jsonidx), "w") as cmd_fp:
+            json.dump(cmd_info, cmd_fp)
 
         idx = 0
         for fname in files_to_verify:
@@ -378,7 +398,7 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             logging.info("File to verify: %s", src_file)
             cur_jsonidx = idx / 1000
             if jsonidx != cur_jsonidx:
-                with open("xfer_commands_{}.json".format(jsonidx), "w") as cmd_fp:
+                with open("verify_commands_{}.json".format(jsonidx), "w") as cmd_fp:
                     json.dump(cmd_info, cmd_fp)
                 jsonidx = cur_jsonidx
                 cmd_info = {}
@@ -390,9 +410,10 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
                 "dest_prefix": dest_prefix
             }
             fp.write(DO_WORK_DAG_VERIFY_SNIPPET.format(name=idx, fileidx=cur_jsonidx,
-                xfer_py=full_exec_path))
+                xfer_py=full_exec_path, src_file=src_file, src_file_noslash=src_file_noslash,
+                dest=dest))
 
-        with open("xfer_commands_{}.json".format(cur_jsonidx), "w") as cmd_fp:
+        with open("verify_commands_{}.json".format(cur_jsonidx), "w") as cmd_fp:
             json.dump(cmd_info, cmd_fp)
 
     for dest_dir in dest_dirs:
