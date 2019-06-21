@@ -601,7 +601,7 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
 def analyze(transfer_manifest):
     sync_request_start = None
     idx = -1
-    sync_request = {'files': {}, 'xfer_files': set()}
+    sync_request = {'files': {}, 'xfer_files': set(), 'verified_files': {}}
     dest_dir = os.path.abspath(os.path.split(transfer_manifest)[0])
     sync_count = 0
 
@@ -628,9 +628,15 @@ def analyze(transfer_manifest):
                     sys.exit(4)
                 if info[1][0] == '{':
                     local_info = json.loads(" ".join(info[1:]))
-                    sync_request['files'][local_info['name']] = int(local_info['size'])
+                    size = int(local_info['size'])
+                    fname = local_info['name']
                 else:
-                    sync_request['files'][info[1]] = int(info[2])
+                    size = int(info[2])
+                    fname = info[1]
+                # File was previously verified.
+                if fname in sync_request['verified_files'] and sync_request['verified_files'][fname] == size:
+                    continue
+                sync_request['files'][fname] = size
                 if info[0] == 'TRANSFER_REQUEST':
                     if info[1][0] == '{':
                         local_info = json.loads(info[1])
@@ -648,6 +654,8 @@ def analyze(transfer_manifest):
                 else:
                     fname = info[1]
                     size = int(info[3])
+                if fname in sync_request['verified_files'] and sync_request['verified_files'][fname] == size:
+                    continue
                 if fname not in sync_request['files']:
                     logging.error("File %s verified but was not requested.", fname)
                     sys.exit(4)
@@ -669,6 +677,7 @@ def analyze(transfer_manifest):
                     sync_request['files_to_verify'] -= 1
                     sync_request['bytes_to_verify'] -= size
                 del sync_request['files'][fname]
+                sync_request['verified_files'][fname] = size
             elif info[0] == 'SYNC_DONE':
                 if sync_request_start is None:
                     logging.error("Transfer request found at line %d before sync started; inconsistent log", idx)
@@ -683,8 +692,9 @@ def analyze(transfer_manifest):
         if sync_request_start is not None and (sync_request['files_to_verify'] or sync_request['bytes_to_verify'] or sync_request['files'] or \
                 sync_request['files_to_transfer'] or sync_request['bytes_to_transfer']):
             logging.error("Sync not done! Work remaining.")
-            logging.error("- Files to transfer: %s", sync_request['files_to_transfer'])
-            logging.error("- Files to verify: %s", sync_request['files_to_verify'])
+            logging.error("- Files to transfer: %s (bytes %d)", sync_request['files_to_transfer'], sync_request['bytes_to_transfer'])
+            logging.error("- Files to verify: %s (bytes %d)", sync_request['files_to_verify'], sync_request['bytes_to_verify'])
+            logging.error("Inconsistent files: {}".format(str(sync_request['files'])))
             sys.exit(4)
     if sync_request_start is not None:
         with open(transfer_manifest, "a") as fp:
