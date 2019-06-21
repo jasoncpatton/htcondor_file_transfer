@@ -326,13 +326,14 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             info = line.strip().split()
             if info[0] != 'TRANSFER_VERIFIED':
                 continue
-                if info[1] == '{':
-                    info = json.loads(info[1])
-                    if 'name' not in info or 'digest' not in info or \
-                            'size' not in info:
-                        continue
-                if len(info) != 5:
+            if info[1] == '{':
+                info = json.loads(" ".join(info[1:]))
+                if 'name' not in info or 'digest' not in info or \
+                        'size' not in info:
                     continue
+            elif len(info) != 5:
+                continue
+            else:
                 fname, hexdigest, size = info[1:-1]
             relative_fname = fname
             files_verified.add(relative_fname)
@@ -355,6 +356,7 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
     idx = 0
     dest_dirs = set()
     jsonidx = 0
+    cur_jsonidx = 0
     cmd_info = {}
     with open("do_work.dag", "w") as fp:
         fp.write(DO_WORK_DAG_HEADER.format("MAXJOBS TRANSFER_JOBS 1" if test_mode else ""))
@@ -390,6 +392,8 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             json.dump(cmd_info, cmd_fp)
 
         idx = 0
+        jsonidx = 0
+        cur_jsonidx = 0
         for fname in files_to_verify:
             idx += 1
             src_file = os.path.join(source_prefix, fname)
@@ -608,10 +612,10 @@ def analyze(transfer_manifest):
             # Format: SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}
             if info[0] == 'SYNC_REQUEST':
                 sync_count += 1
-                if sync_request_start is not None:
-                    logging.error("Sync request started at line %d but never finished; inconsistent log",
-                        sync_request_start)
-                    sys.exit(4)
+                #if sync_request_start is not None:
+                #    logging.error("Sync request started at line %d but never finished; inconsistent log",
+                #        sync_request_start)
+                #    sys.exit(4)
                 sync_request_start = idx
                 for entry in info[2:]:
                     key, val = entry.split("=")
@@ -623,7 +627,7 @@ def analyze(transfer_manifest):
                     logging.error("Transfer request found at line %d before sync started; inconsistent log", idx)
                     sys.exit(4)
                 if info[1][0] == '{':
-                    local_info = json.loads(info[1])
+                    local_info = json.loads(" ".join(info[1:]))
                     sync_request['files'][local_info['name']] = int(local_info['size'])
                 else:
                     sync_request['files'][info[1]] = int(info[2])
@@ -638,7 +642,7 @@ def analyze(transfer_manifest):
                     logging.error("Transfer verification found at line %d before sync started; inconsistent log", idx)
                     sys.exit(4)
                 if info[1][0] == '{':
-                    local_info = json.loads(info[1])
+                    local_info = json.loads(" ".join(info[1:]))
                     fname = local_info['name']
                     size = int(local_info['size'])
                 else:
