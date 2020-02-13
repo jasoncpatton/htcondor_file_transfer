@@ -45,7 +45,7 @@ log = calc_work.log
 arguments = generate {source_dir} {other_args}
 should_transfer_files = YES
 transfer_output_files = source_manifest.txt
-requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
+requirements = {requirements}
 +IS_TRANSFER_JOB = true
 +WantFlocking = true
 keep_claim_idle = 300
@@ -56,7 +56,7 @@ queue
 XFER_FILE_JOB = \
 """
 universe = vanilla
-executable = {}
+executable = {xfer_py}
 output = $(src_file_noslash).out
 error = $(src_file_noslash).err
 log = xfer_file.log
@@ -64,7 +64,7 @@ Args = "exec '$(src_file)'"
 should_transfer_files = YES
 transfer_output_files = file0, metadata
 transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).metadata"
-requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
+requirements = {requirements}
 +IS_TRANSFER_JOB = true
 +WantFlocking = true
 
@@ -82,7 +82,7 @@ Args = "exec_n --json '$(name)'"
 should_transfer_files = YES
 transfer_output_files = {file_list}, metadata
 transfer_output_remaps = "{file_list}; metadata = result_$(name).metadata"
-requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
+requirements = {requirements}
 +IS_TRANSFER_JOB = true
 +WantFlocking = true
 
@@ -92,7 +92,7 @@ queue
 VERIFY_FILE_JOB = \
 """
 universe = vanilla
-executable = {}
+executable = {xfer_py}
 output = $(src_file_noslash).out
 error = $(src_file_noslash).err
 log = xfer_file.log
@@ -100,7 +100,7 @@ Args = "verify_remote '$(src_file)'"
 should_transfer_files = YES
 transfer_output_files = metadata
 transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
-requirements = Machine =?= "spaldingwcic0.chtc.wisc.edu"
+requirements = {requirements}
 +IS_TRANSFER_JOB = true
 +WantFlocking = true
 
@@ -158,6 +158,9 @@ def parse_args():
         default="./scratch_dir", dest="working_dir")
     parser_sync.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
+    parser_sync.add_argument("--requirements",
+        help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')",
+        default="True")
 
     parser_generate = subparsers.add_parser("generate")
     parser_generate.add_argument("src")
@@ -209,7 +212,7 @@ def generate_file_listing(src, manifest, test_mode=False):
                     fp.write("{}\n".format(json.dumps(info)))
 
 
-def submit_parent_dag(working_dir, source_dir, dest_dir, test_mode=False):
+def submit_parent_dag(working_dir, source_dir, dest_dir, requirements, test_mode=False):
     try:
         os.makedirs(os.path.join(working_dir, "calc_work"))
     except OSError as oe:
@@ -226,7 +229,7 @@ def submit_parent_dag(working_dir, source_dir, dest_dir, test_mode=False):
 
     with open(os.path.join(working_dir, "calc_work", "calc_work.sub"), "w") as fd:
         fd.write(CALC_WORK_JOB.format(exec_py=full_exec_path, source_dir=source_dir,
-            other_args="--test-mode" if test_mode else ""))
+            other_args="--test-mode" if test_mode else "", requirements=requirements))
 
     dagman = search_path("condor_dagman")
     if not dagman:
@@ -296,7 +299,7 @@ def parse_manifest(prefix, manifest, log_name):
     return files
 
 
-def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, transfer_manifest, test_mode=False):
+def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, transfer_manifest, requirements, test_mode=False):
     src_files = parse_manifest(source_prefix, source_manifest, "Source")
 
     generate_file_listing(dest_prefix, "destination_manifest.txt")
@@ -349,9 +352,9 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
     full_exec_path = os.path.join(os.path.abspath(info[0]), info[1])
 
     with open("xfer_file.sub", "w") as fp:
-        fp.write(XFER_FILE_JOB.format(full_exec_path))
+        fp.write(XFER_FILE_JOB.format(xfer_py=full_exec_path, requirements=requirements))
     with open("verify_file.sub", "w") as fp:
-        fp.write(VERIFY_FILE_JOB.format(full_exec_path))
+        fp.write(VERIFY_FILE_JOB.format(xfer_py=full_exec_path, requirements=requirements))
 
     idx = 0
     dest_dirs = set()
@@ -715,14 +718,14 @@ def main():
     if args.cmd == "sync":
         working_dir = args.working_dir if args.working_dir else os.getcwd()
         print("Will synchronize %s at source to %s at destination" % (args.src, args.dest))
-        cluster_id = submit_parent_dag(working_dir, args.src, os.path.abspath(args.dest), test_mode=args.test_mode)
+        cluster_id = submit_parent_dag(working_dir, args.src, os.path.abspath(args.dest), requirements=args.requirements, test_mode=args.test_mode)
         print("Parent job running in cluster %d" % cluster_id)
     elif args.cmd == "generate":
         logging.info("Generating file listing for %s", args.src)
         generate_file_listing(args.src, "source_manifest.txt", test_mode=args.test_mode)
     elif args.cmd == "write_subdag":
         logging.info("Generating SUBGDAG for transfer of %s->%s", args.source_prefix, args.dest_prefix)
-        write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, args.transfer_manifest, test_mode=args.test_mode)
+        write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, args.transfer_manifest, requirements=args.requirements, test_mode=args.test_mode)
     elif args.cmd == "exec":
         xfer_exec(args.src)
     elif args.cmd == "verify":
