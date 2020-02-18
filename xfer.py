@@ -166,7 +166,7 @@ def parse_args():
         default="./scratch_dir", dest="working_dir")
     parser_sync.add_argument("--requirements",
         help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')")
-    parser_subdag.add_argument("--requirements_file", help="File containing submit file requirements")
+    parser_sync.add_argument("--requirements_file", help="File containing submit file requirements")
     parser_sync.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
 
