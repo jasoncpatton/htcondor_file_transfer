@@ -27,7 +27,7 @@ JOB CalculateWork calc_work.sub DIR calc_work
 
 # Gather the local file listing and write out the sub-DAG
 # to perform the actual transfers
-SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {other_args}
+SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {requirements} {other_args}
 
 SUBDAG EXTERNAL DoXfers calc_work/do_work.dag
 SCRIPT POST DoXfers {exec_py} analyze {transfer_manifest}
@@ -147,6 +147,14 @@ def search_path(exec_name):
             return fname
 
 
+def read_requirements_file(requirements_file):
+    requirements = None
+    if requirements_file is not None:
+        with open(requirements_file, 'r') as f:
+            requirements = f.readline().rstrip()
+    return requirements
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="cmd")
@@ -156,11 +164,11 @@ def parse_args():
     parser_sync.add_argument("dest")
     parser_sync.add_argument("--working-dir", help="Directory to place working HTCondor files.",
         default="./scratch_dir", dest="working_dir")
+    parser_sync.add_argument("--requirements",
+        help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')")
+    parser_sync.add_argument("--requirements_file", help="File containing submit file requirements")
     parser_sync.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
-    parser_sync.add_argument("--requirements",
-        help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')",
-        default="True")
 
     parser_generate = subparsers.add_parser("generate")
     parser_generate.add_argument("src")
@@ -173,6 +181,8 @@ def parse_args():
     parser_subdag.add_argument("dest_prefix")
     parser_subdag.add_argument("dest_manifest")
     parser_subdag.add_argument("transfer_manifest")
+    parser_subdag.add_argument("--requirements", help="Submit file requirements")
+    parser_subdag.add_argument("--requirements_file", help="File containing submit file requirements")
     parser_subdag.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
 
@@ -193,7 +203,7 @@ def parse_args():
 
     parser_analyze = subparsers.add_parser("analyze")
     parser_analyze.add_argument("transfer_manifest")
- 
+
     return parser.parse_args()
 
 
@@ -212,7 +222,7 @@ def generate_file_listing(src, manifest, test_mode=False):
                     fp.write("{}\n".format(json.dumps(info)))
 
 
-def submit_parent_dag(working_dir, source_dir, dest_dir, requirements, test_mode=False):
+def submit_parent_dag(working_dir, source_dir, dest_dir, requirements=None, test_mode=False):
     try:
         os.makedirs(os.path.join(working_dir, "calc_work"))
     except OSError as oe:
@@ -222,14 +232,20 @@ def submit_parent_dag(working_dir, source_dir, dest_dir, requirements, test_mode
     info = os.path.split(sys.argv[0])
     full_exec_path = os.path.join(os.path.abspath(info[0]), info[1])
 
+    if requirements is not None:
+        with open(os.path.join(working_dir, "calc_work", "requirements.txt"), "w") as fd:
+            fd.write(requirements)
+
     with open(os.path.join(working_dir, "xfer.dag"), "w") as fd:
         fd.write(PARENT_DAG.format(exec_py=full_exec_path, source_prefix=source_dir,
             dest_prefix=dest_dir, other_args="--test-mode" if test_mode else "",
-            transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt")))
+            transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt"),
+            requirements="--requirements_file=requirements.txt" if requirements is not None else ""))
 
     with open(os.path.join(working_dir, "calc_work", "calc_work.sub"), "w") as fd:
         fd.write(CALC_WORK_JOB.format(exec_py=full_exec_path, source_dir=source_dir,
-            other_args="--test-mode" if test_mode else "", requirements=requirements))
+            other_args="--test-mode" if test_mode else "",
+            requirements=requirements if requirements is not None else "True"))
 
     dagman = search_path("condor_dagman")
     if not dagman:
@@ -299,7 +315,7 @@ def parse_manifest(prefix, manifest, log_name):
     return files
 
 
-def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, transfer_manifest, requirements, test_mode=False):
+def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, transfer_manifest, requirements=None, test_mode=False):
     src_files = parse_manifest(source_prefix, source_manifest, "Source")
 
     generate_file_listing(dest_prefix, "destination_manifest.txt")
@@ -352,9 +368,11 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
     full_exec_path = os.path.join(os.path.abspath(info[0]), info[1])
 
     with open("xfer_file.sub", "w") as fp:
-        fp.write(XFER_FILE_JOB.format(xfer_py=full_exec_path, requirements=requirements))
+        fp.write(XFER_FILE_JOB.format(xfer_py=full_exec_path,
+            requirements=requirements if requirements is not None else "True"))
     with open("verify_file.sub", "w") as fp:
-        fp.write(VERIFY_FILE_JOB.format(xfer_py=full_exec_path, requirements=requirements))
+        fp.write(VERIFY_FILE_JOB.format(xfer_py=full_exec_path,
+            requirements=requirements if requirements is not None else "True"))
 
     idx = 0
     dest_dirs = set()
@@ -718,14 +736,16 @@ def main():
     if args.cmd == "sync":
         working_dir = args.working_dir if args.working_dir else os.getcwd()
         print("Will synchronize %s at source to %s at destination" % (args.src, args.dest))
-        cluster_id = submit_parent_dag(working_dir, args.src, os.path.abspath(args.dest), requirements=args.requirements, test_mode=args.test_mode)
+        cluster_id = submit_parent_dag(working_dir, args.src, os.path.abspath(args.dest),
+            requirements=read_requirements_file(args.requirements_file) or args.requirements, test_mode=args.test_mode)
         print("Parent job running in cluster %d" % cluster_id)
     elif args.cmd == "generate":
         logging.info("Generating file listing for %s", args.src)
         generate_file_listing(args.src, "source_manifest.txt", test_mode=args.test_mode)
     elif args.cmd == "write_subdag":
         logging.info("Generating SUBGDAG for transfer of %s->%s", args.source_prefix, args.dest_prefix)
-        write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, args.transfer_manifest, requirements=args.requirements, test_mode=args.test_mode)
+        write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, args.transfer_manifest,
+            requirements=read_requirements_file(args.requirements_file) or args.requirements, test_mode=args.test_mode)
     elif args.cmd == "exec":
         xfer_exec(args.src)
     elif args.cmd == "verify":
