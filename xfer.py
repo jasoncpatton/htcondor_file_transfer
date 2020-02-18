@@ -27,7 +27,7 @@ JOB CalculateWork calc_work.sub DIR calc_work
 
 # Gather the local file listing and write out the sub-DAG
 # to perform the actual transfers
-SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {requirements} {other_args}
+SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} --requirements='{requirements}' {other_args}
 
 SUBDAG EXTERNAL DoXfers calc_work/do_work.dag
 SCRIPT POST DoXfers {exec_py} analyze {transfer_manifest}
@@ -163,8 +163,6 @@ def parse_args():
 
     parser_generate = subparsers.add_parser("generate")
     parser_generate.add_argument("src")
-    parser_generate.add_argument("--requirements",
-        help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')", default="True")
     parser_generate.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
 
@@ -200,7 +198,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def generate_file_listing(src, manifest, requirements, test_mode=False):
+def generate_file_listing(src, manifest, test_mode=False):
     with open(manifest, "w") as fp:
         for root, dirs, fnames in os.walk(src):
             for fname in fnames:
@@ -726,7 +724,7 @@ def main():
         print("Parent job running in cluster %d" % cluster_id)
     elif args.cmd == "generate":
         logging.info("Generating file listing for %s", args.src)
-        generate_file_listing(args.src, "source_manifest.txt", requirements=args.requirements, test_mode=args.test_mode)
+        generate_file_listing(args.src, "source_manifest.txt", test_mode=args.test_mode)
     elif args.cmd == "write_subdag":
         logging.info("Generating SUBGDAG for transfer of %s->%s", args.source_prefix, args.dest_prefix)
         write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, args.transfer_manifest, requirements=args.requirements, test_mode=args.test_mode)
