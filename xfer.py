@@ -233,15 +233,14 @@ def submit_parent_dag(working_dir, source_dir, dest_dir, requirements=None, test
     full_exec_path = os.path.join(os.path.abspath(info[0]), info[1])
 
     if requirements is not None:
-        requirements_path = os.path.join(working_dir, "requirements.txt")
-        with open(requirements_path, "w") as fd:
+        with open(os.path.join(working_dir, "calc_work", "requirements.txt"), "w") as fd:
             fd.write(requirements)
 
     with open(os.path.join(working_dir, "xfer.dag"), "w") as fd:
         fd.write(PARENT_DAG.format(exec_py=full_exec_path, source_prefix=source_dir,
             dest_prefix=dest_dir, other_args="--test-mode" if test_mode else "",
             transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt"),
-            requirements="--requirements_file={}".format(requirements_path) if requirements is not None else ""))
+            requirements="--requirements_file=requirements.txt" if requirements is not None else ""))
 
     with open(os.path.join(working_dir, "calc_work", "calc_work.sub"), "w") as fd:
         fd.write(CALC_WORK_JOB.format(exec_py=full_exec_path, source_dir=source_dir,
