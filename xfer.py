@@ -709,7 +709,7 @@ def analyze(transfer_manifest):
                     logging.error("SYNC_DONE but there is work remaining: %s", str(sync_request))
                     sys.exit(4)
                 sync_request_start = None
-                sync_request = {'files': {}, 'xfer_files': set()}
+                sync_request = {'files': {}, 'xfer_files': set(), 'verified_files': {}}
         if sync_request_start is not None and (sync_request['files_to_verify'] or sync_request['bytes_to_verify'] or sync_request['files'] or \
                 sync_request['files_to_transfer'] or sync_request['bytes_to_transfer']):
             logging.error("Sync not done! Work remaining.")
