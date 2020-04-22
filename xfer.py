@@ -47,7 +47,7 @@ should_transfer_files = YES
 transfer_output_files = source_manifest.txt
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
-+UniqueId = {unique_id}
++UniqueId = "{unique_id}"
 +WantFlocking = true
 keep_claim_idle = 300
 
@@ -67,7 +67,7 @@ transfer_output_files = file0, metadata
 transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).metadata"
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
-+UniqueId = {unique_id}
++UniqueId = "{unique_id}"
 +WantFlocking = true
 
 queue
@@ -86,7 +86,7 @@ transfer_output_files = {file_list}, metadata
 transfer_output_remaps = "{file_list}; metadata = result_$(name).metadata"
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
-+UniqueId = {unique_id}
++UniqueId = "{unique_id}"
 +WantFlocking = true
 
 queue
@@ -105,7 +105,7 @@ transfer_output_files = metadata
 transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
-+UniqueId = {unique_id}
++UniqueId = "{unique_id}"
 +WantFlocking = true
 
 queue
