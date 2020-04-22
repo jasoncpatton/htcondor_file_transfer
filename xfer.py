@@ -27,7 +27,7 @@ JOB CalculateWork calc_work.sub DIR calc_work
 
 # Gather the local file listing and write out the sub-DAG
 # to perform the actual transfers
-SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {requirements} {other_args}
+SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {requirements} {unique_id} {other_args}
 
 SUBDAG EXTERNAL DoXfers calc_work/do_work.dag
 SCRIPT POST DoXfers {exec_py} analyze {transfer_manifest}
@@ -47,6 +47,7 @@ should_transfer_files = YES
 transfer_output_files = source_manifest.txt
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
++UniqueId = {unique_id}
 +WantFlocking = true
 keep_claim_idle = 300
 
@@ -66,6 +67,7 @@ transfer_output_files = file0, metadata
 transfer_output_remaps = "file0 = $(dst_file); metadata = $(src_file_noslash).metadata"
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
++UniqueId = {unique_id}
 +WantFlocking = true
 
 queue
@@ -84,6 +86,7 @@ transfer_output_files = {file_list}, metadata
 transfer_output_remaps = "{file_list}; metadata = result_$(name).metadata"
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
++UniqueId = {unique_id}
 +WantFlocking = true
 
 queue
@@ -102,6 +105,7 @@ transfer_output_files = metadata
 transfer_output_remaps = "metadata = $(src_file_noslash).metadata"
 requirements = {requirements}
 +IS_TRANSFER_JOB = true
++UniqueId = {unique_id}
 +WantFlocking = true
 
 queue
@@ -167,6 +171,8 @@ def parse_args():
     parser_sync.add_argument("--requirements",
         help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')")
     parser_sync.add_argument("--requirements_file", help="File containing submit file requirements")
+    parser_sync.add_argument("--unique-id", help="Do not submit if jobs with UniqueId already found in queue",
+        dest="unique_id")
     parser_sync.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
 
@@ -183,6 +189,7 @@ def parse_args():
     parser_subdag.add_argument("transfer_manifest")
     parser_subdag.add_argument("--requirements", help="Submit file requirements")
     parser_subdag.add_argument("--requirements_file", help="File containing submit file requirements")
+    parser_subdag.add_argument("--unique-id", help="Set UniqueId in submitted jobs", dest="unique_id")
     parser_subdag.add_argument("--test-mode", help="Testing mode (only transfers small files)",
         default=False, action="store_true", dest="test_mode")
 
@@ -222,7 +229,7 @@ def generate_file_listing(src, manifest, test_mode=False):
                     fp.write("{}\n".format(json.dumps(info)))
 
 
-def submit_parent_dag(working_dir, source_dir, dest_dir, requirements=None, test_mode=False):
+def submit_parent_dag(working_dir, source_dir, dest_dir, requirements=None, test_mode=False, unique_id=None):
     try:
         os.makedirs(os.path.join(working_dir, "calc_work"))
     except OSError as oe:
@@ -240,12 +247,14 @@ def submit_parent_dag(working_dir, source_dir, dest_dir, requirements=None, test
         fd.write(PARENT_DAG.format(exec_py=full_exec_path, source_prefix=source_dir,
             dest_prefix=dest_dir, other_args="--test-mode" if test_mode else "",
             transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt"),
-            requirements="--requirements_file=requirements.txt" if requirements is not None else ""))
+            requirements="--requirements_file=requirements.txt" if requirements is not None else "",
+            unique_id="--unique_id={}".format(unique_id) if unique_id is not None else ""))
 
     with open(os.path.join(working_dir, "calc_work", "calc_work.sub"), "w") as fd:
         fd.write(CALC_WORK_JOB.format(exec_py=full_exec_path, source_dir=source_dir,
             other_args="--test-mode" if test_mode else "",
-            requirements=requirements if requirements is not None else "True"))
+            requirements=requirements if requirements is not None else "True",
+            unique_id=unique_id if unique_id is not None else ""))
 
     dagman = search_path("condor_dagman")
     if not dagman:
@@ -315,7 +324,7 @@ def parse_manifest(prefix, manifest, log_name):
     return files
 
 
-def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, transfer_manifest, requirements=None, test_mode=False):
+def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, transfer_manifest, requirements=None, test_mode=False, unique_id=None):
     src_files = parse_manifest(source_prefix, source_manifest, "Source")
 
     generate_file_listing(dest_prefix, "destination_manifest.txt")
@@ -369,10 +378,12 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
 
     with open("xfer_file.sub", "w") as fp:
         fp.write(XFER_FILE_JOB.format(xfer_py=full_exec_path,
-            requirements=requirements if requirements is not None else "True"))
+            requirements=requirements if requirements is not None else "True",
+            unique_id=unique_id if unique_id is not None else ""))
     with open("verify_file.sub", "w") as fp:
         fp.write(VERIFY_FILE_JOB.format(xfer_py=full_exec_path,
-            requirements=requirements if requirements is not None else "True"))
+            requirements=requirements if requirements is not None else "True",
+            unique_id=unique_id if unique_id is not None else ""))
 
     idx = 0
     dest_dirs = set()
@@ -627,8 +638,8 @@ def analyze(transfer_manifest):
     sync_count = 0
 
     with open(transfer_manifest, "r") as fp:
-        idx += 1
         for line in fp.xreadlines():
+            idx += 1
             info = line.strip().split()
             # Format: SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}
             if info[0] == 'SYNC_REQUEST':
@@ -734,10 +745,17 @@ def main():
     args = parse_args()
 
     if args.cmd == "sync":
+        if args.unique_id:
+            schedd = htcondor.Schedd()
+            if len(schedd.query(constraint = 'UniqueId == "{}" && JobStatus =!= 4'.format(args.unique_id),
+                                attr_list = ["ServerTime"], limit = 1)) > 0:
+                logging.warning('Jobs already found in queue with UniqueId == "%s", exiting', args.unique_id)
+                sys.exit()
         working_dir = args.working_dir if args.working_dir else os.getcwd()
         print("Will synchronize %s at source to %s at destination" % (args.src, args.dest))
         cluster_id = submit_parent_dag(working_dir, args.src, os.path.abspath(args.dest),
-            requirements=read_requirements_file(args.requirements_file) or args.requirements, test_mode=args.test_mode)
+            requirements=read_requirements_file(args.requirements_file) or args.requirements, test_mode=args.test_mode,
+            unique_id=args.unique_id)
         print("Parent job running in cluster %d" % cluster_id)
     elif args.cmd == "generate":
         logging.info("Generating file listing for %s", args.src)
@@ -745,7 +763,8 @@ def main():
     elif args.cmd == "write_subdag":
         logging.info("Generating SUBGDAG for transfer of %s->%s", args.source_prefix, args.dest_prefix)
         write_subdag(args.source_prefix, args.source_manifest, args.dest_prefix, args.dest_manifest, args.transfer_manifest,
-            requirements=read_requirements_file(args.requirements_file) or args.requirements, test_mode=args.test_mode)
+            requirements=read_requirements_file(args.requirements_file) or args.requirements, test_mode=args.test_mode,
+            unique_id=args.unique_id)
     elif args.cmd == "exec":
         xfer_exec(args.src)
     elif args.cmd == "verify":
