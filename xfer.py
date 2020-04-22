@@ -248,7 +248,7 @@ def submit_parent_dag(working_dir, source_dir, dest_dir, requirements=None, test
             dest_prefix=dest_dir, other_args="--test-mode" if test_mode else "",
             transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt"),
             requirements="--requirements_file=requirements.txt" if requirements is not None else "",
-            unique_id="--unique_id={}".format(unique_id) if unique_id is not None else ""))
+            unique_id="--unique-id={}".format(unique_id) if unique_id is not None else ""))
 
     with open(os.path.join(working_dir, "calc_work", "calc_work.sub"), "w") as fd:
         fd.write(CALC_WORK_JOB.format(exec_py=full_exec_path, source_dir=source_dir,
