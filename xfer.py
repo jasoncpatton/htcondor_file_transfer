@@ -747,8 +747,8 @@ def main():
     if args.cmd == "sync":
         if args.unique_id:
             schedd = htcondor.Schedd()
-            if len(schedd.query(constraint = 'UniqueId == "{}" && JobStatus =!= 4'.format(args.unique_id).encode(),
-                                attr_list = ["ServerTime"], limit = 1)) > 0:
+            if len(schedd.query(constraint = 'UniqueId == "{}" && JobStatus =!= 4'.format(args.unique_id),
+                                attr_list = [], limit = 1)) > 0:
                 logging.warning('Jobs already found in queue with UniqueId == "%s", exiting', args.unique_id)
                 sys.exit()
         working_dir = args.working_dir if args.working_dir else os.getcwd()
