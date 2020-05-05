@@ -671,7 +671,7 @@ def analyze(transfer_manifest):
                 sync_request['files'][fname] = size
                 if info[0] == 'TRANSFER_REQUEST':
                     if info[1][0] == '{':
-                        local_info = json.loads(info[1])
+                        local_info = json.loads(" ".join(info[1:]))
                         sync_request['xfer_files'].add(local_info['name'])
                     else:
                         sync_request['xfer_files'].add(info[1])
