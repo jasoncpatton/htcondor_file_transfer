@@ -50,6 +50,7 @@ requirements = {requirements}
 +UniqueId = "{unique_id}"
 +WantFlocking = true
 keep_claim_idle = 300
+request_disk = 1GB
 
 queue
 """
@@ -69,6 +70,7 @@ requirements = {requirements}
 +IS_TRANSFER_JOB = true
 +UniqueId = "{unique_id}"
 +WantFlocking = true
+request_disk = 1GB
 
 queue
 """
@@ -88,6 +90,7 @@ requirements = {requirements}
 +IS_TRANSFER_JOB = true
 +UniqueId = "{unique_id}"
 +WantFlocking = true
+request_disk = 1GB
 
 queue
 """
@@ -107,6 +110,7 @@ requirements = {requirements}
 +IS_TRANSFER_JOB = true
 +UniqueId = "{unique_id}"
 +WantFlocking = true
+request_disk = 1GB
 
 queue
 """
