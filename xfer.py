@@ -1,13 +1,12 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 """
 Utilize HTCondor to transfer / synchronize a directory from a source on an
 execute host to a local destination on the submit host.
 """
 
-from __future__ import print_function, unicode_literals
-
 import argparse
+import contextlib
 import errno
 import hashlib
 import logging
@@ -16,6 +15,7 @@ import re
 import sys
 import json
 import time
+from pathlib import Path
 
 import htcondor
 
@@ -135,20 +135,6 @@ SCRIPT POST verify_{name} {xfer_py} verify --json=verify_commands_{fileidx}.json
 """
 
 
-_SIMPLE_FNAME_RE = re.compile("^[0-9A-Za-z_./:\-]+$")
-
-
-def simple_fname(fname):
-    return _SIMPLE_FNAME_RE.match(fname)
-
-
-def search_path(exec_name):
-    for path in os.environ.get("PATH", "/usr/bin:/bin").split(":"):
-        fname = os.path.join(path, exec_name)
-        if os.access(fname, os.X_OK):
-            return fname
-
-
 def read_requirements_file(requirements_file):
     requirements = None
     if requirements_file is not None:
@@ -250,11 +236,8 @@ def generate_file_listing(src, manifest, test_mode=False):
                 size = os.stat(full_fname).st_size
                 if test_mode and size > 50 * 1024 * 1024:
                     continue
-                if simple_fname(full_fname):
-                    fp.write("{} {}\n".format(full_fname, size))
-                else:
-                    info = {"name": full_fname, "size": size}
-                    fp.write("{}\n".format(json.dumps(info)))
+                info = {"name": full_fname, "size": size}
+                fp.write("{}\n".format(json.dumps(info)))
 
 
 def submit_parent_dag(
@@ -265,88 +248,62 @@ def submit_parent_dag(
     test_mode=False,
     unique_id=None,
 ):
-    try:
-        os.makedirs(os.path.join(working_dir, "calc_work"))
-    except OSError as oe:
-        if oe.errno != errno.EEXIST:
-            raise
+    working_dir = Path(working_dir).absolute()
+
+    calc_work = working_dir / "calc_work"
+    calc_work.mkdir(parents=True, exist_ok=True)
 
     info = os.path.split(sys.argv[0])
     full_exec_path = os.path.join(os.path.abspath(info[0]), info[1])
 
-    if requirements is not None:
-        with open(
-            os.path.join(working_dir, "calc_work", "requirements.txt"), "w"
-        ) as fd:
-            fd.write(requirements)
+    if requirements:
+        (calc_work / "requirements.txt").write_text(requirements)
 
-    with open(os.path.join(working_dir, "xfer.dag"), "w") as fd:
-        fd.write(
-            PARENT_DAG.format(
-                exec_py=full_exec_path,
-                source_prefix=source_dir,
-                dest_prefix=dest_dir,
-                other_args="--test-mode" if test_mode else "",
-                transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt"),
-                requirements="--requirements_file=requirements.txt"
-                if requirements is not None
-                else "",
-                unique_id="--unique-id={}".format(unique_id)
-                if unique_id is not None
-                else "",
-            )
+    calc_work_sub = calc_work / "calc_work.sub"
+    calc_work_sub.write_text(
+        CALC_WORK_JOB.format(
+            exec_py=full_exec_path,
+            source_dir=source_dir,
+            other_args="--test-mode" if test_mode else "",
+            requirements=requirements if requirements is not None else "True",
+            unique_id=unique_id if unique_id is not None else "",
         )
+    )
 
-    with open(os.path.join(working_dir, "calc_work", "calc_work.sub"), "w") as fd:
-        fd.write(
-            CALC_WORK_JOB.format(
-                exec_py=full_exec_path,
-                source_dir=source_dir,
-                other_args="--test-mode" if test_mode else "",
-                requirements=requirements if requirements is not None else "True",
-                unique_id=unique_id if unique_id is not None else "",
-            )
+    dag_file = working_dir / "xfer.dag"
+    dag_file.write_text(
+        PARENT_DAG.format(
+            exec_py=full_exec_path,
+            source_prefix=source_dir,
+            dest_prefix=dest_dir,
+            other_args="--test-mode" if test_mode else "",
+            transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt"),
+            requirements="--requirements_file=requirements.txt"
+            if requirements is not None
+            else "",
+            unique_id="--unique-id={}".format(unique_id)
+            if unique_id is not None
+            else "",
         )
+    )
 
-    dagman = search_path("condor_dagman")
-    if not dagman:
-        print("Unable to find the `condor_dagman` executable in the $PATH")
-        sys.exit(1)
+    sub = htcondor.Submit.from_dag(str(dag_file))
 
-    submit_dict = {
-        b"universe": b"scheduler",
-        b"executable": dagman.encode("utf-8"),
-        b"output": b"xfer.dag.lib.out",
-        b"error": b"xfer.dag.lib.err",
-        b"log": b"xfer.dag.dagman.log",
-        b"remove_kill_Sig": b"SIGUSR1",
-        b"+OtherJobRemoveRequirements": b'"DAGManJobId =?= $(cluster)"',
-        b"on_exit_remove": b"(ExitSignal =?= 11 || (ExitCode =!= UNDEFINED && "
-        b"ExitCode >=0 && ExitCode <= 2))",
-        b"arguments": b'"-p 0 -f -l . -Lockfile xfer.dag.lock -AutoRescue 1 -DoRescueFrom 0'
-        b" -Dag xfer.dag -Suppress_notification -Dagman /usr/bin/condor_dagman"
-        b' -CsdVersion {}"'.format(htcondor.version().replace(" ", "' '")),
-        b"environment": b"_CONDOR_SCHEDD_ADDRESS_FILE={};_CONDOR_MAX_DAGMAN_LOG=0;"
-        b"_CONDOR_SCHEDD_DAEMON_AD_FILE={};_CONDOR_DAGMAN_LOG=xfer.dag.dagman.out".format(
-            htcondor.param[b"SCHEDD_ADDRESS_FILE"],
-            htcondor.param[b"SCHEDD_DAEMON_AD_FILE"],
-        ),
-    }
-
-    schedd = htcondor.Schedd()
-
-    orig_pwd = os.getcwd()
-    try:
-        os.chdir(working_dir)
-        sub = htcondor.Submit(submit_dict)
+    with change_dir(working_dir):
+        schedd = htcondor.Schedd()
         with schedd.transaction() as txn:
             return sub.queue(txn)
-    finally:
-        os.chdir(orig_pwd)
+
+
+@contextlib.contextmanager
+def change_dir(dir):
+    original = os.getcwd()
+    os.chdir(dir)
+    yield
+    os.chdir(original)
 
 
 def parse_manifest(prefix, manifest, log_name):
-
     prefix = os.path.normpath(prefix)
     files = {}
     with open(manifest, "r") as fd:
@@ -372,7 +329,7 @@ def parse_manifest(prefix, manifest, log_name):
                     raise Exception(
                         "Manifest lines must have two columns.  Current line: %s" % line
                     )
-                fname = info[0].decode("utf-8")
+                fname = info[0]
                 size = int(info[1])
             if not fname.startswith(prefix):
                 logging.error(
@@ -398,7 +355,7 @@ def write_subdag(
     test_mode=False,
     unique_id=None,
 ):
-    src_files = parse_manifest(source_prefix, source_manifest, "Source")
+    src_files = parse_manifest(source_prefix, Path(source_manifest), "Source")
 
     generate_file_listing(dest_prefix, "destination_manifest.txt")
     dest_files = parse_manifest(dest_prefix, "destination_manifest.txt", "Destination")
@@ -570,17 +527,11 @@ def write_subdag(
             )
         )
         for fname in files_to_xfer:
-            if simple_fname(fname):
-                fp.write("TRANSFER_REQUEST {} {}\n".format(fname, src_files[fname]))
-            else:
-                info = {"name": fname, "size": src_files[fname]}
-                fp.write("TRANSFER_REQUEST {}\n".format(json.dumps(info)))
+            info = {"name": fname, "size": src_files[fname]}
+            fp.write("TRANSFER_REQUEST {}\n".format(json.dumps(info)))
         for fname in files_to_verify:
-            if simple_fname(fname):
-                fp.write("VERIFY_REQUEST {} {}\n".format(fname, src_files[fname]))
-            else:
-                info = {"name": fname, "size": src_files[fname]}
-                fp.write("VERIFY_REQUEST {}\n".format(json.dumps(info)))
+            info = {"name": fname, "size": src_files[fname]}
+            fp.write("VERIFY_REQUEST {}\n".format(json.dumps(info)))
 
 
 def xfer_exec(src):
@@ -620,15 +571,8 @@ def xfer_exec(src):
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
     with open("metadata", "w") as metadata_fd:
-        if simple_fname(src):
-            metadata_fd.write(
-                "{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode(
-                    "utf-8"
-                )
-            )
-        else:
-            info = {"name": src, "digest": hash_obj.hexdigest(), "size": byte_count}
-            metadata_fd.write("{}\n".format(json.dumps(info)))
+        info = {"name": src, "digest": hash_obj.hexdigest(), "size": byte_count}
+        metadata_fd.write("{}\n".format(json.dumps(info)))
 
 
 def verify_remote(src):
@@ -663,15 +607,8 @@ def verify_remote(src):
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
     with open("metadata", "w") as metadata_fd:
-        if simple_fname(src):
-            metadata_fd.write(
-                "{} {} {}\n".format(src, hash_obj.hexdigest(), byte_count).encode(
-                    "utf-8"
-                )
-            )
-        else:
-            info = {"name": src, "digest": hash_obj.hexdigest(), "size": byte_count}
-            metadata_fd.write("{}\n".format(json.dumps(info)))
+        info = {"name": src, "digest": hash_obj.hexdigest(), "size": byte_count}
+        metadata_fd.write("{}\n".format(json.dumps(info)))
 
 
 def verify(dest_prefix, dest, metadata, metadata_summary):
@@ -697,7 +634,7 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
             if len(info) != 3:
                 logging.error("Metadata file format incorrect")
                 sys.exit(1)
-            src_fname = info[0].decode("utf-8")
+            src_fname = info[0]
             src_hexdigest = info[1]
             src_size = int(info[2])
 
@@ -753,20 +690,13 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
         )
 
     with open(metadata_summary, "a") as md_fd:
-        if simple_fname(relative_fname):
-            md_fd.write(
-                "TRANSFER_VERIFIED {} {} {} {}\n".format(
-                    relative_fname, src_hexdigest, src_size, int(time.time())
-                ).encode("utf-8")
-            )
-        else:
-            info = {
-                "name": relative_fname,
-                "digest": src_hexdigest,
-                "size": src_size,
-                "timestamp": int(time.time()),
-            }
-            md_fd.write("TRANSFER_VERIFIED {}\n".format(json.dumps(info)))
+        info = {
+            "name": relative_fname,
+            "digest": src_hexdigest,
+            "size": src_size,
+            "timestamp": int(time.time()),
+        }
+        md_fd.write("TRANSFER_VERIFIED {}\n".format(json.dumps(info)))
         os.fsync(md_fd.fileno())
 
     os.unlink(metadata)
@@ -787,7 +717,7 @@ def analyze(transfer_manifest):
     sync_count = 0
 
     with open(transfer_manifest, "r") as fp:
-        for line in fp.xreadlines():
+        for line in fp.readlines():
             idx += 1
             info = line.strip().split()
             # Format: SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}
@@ -950,7 +880,7 @@ def main():
                     schedd.query(
                         constraint='UniqueId == "{}" && JobStatus =!= 4'.format(
                             args.unique_id
-                        ).encode(),
+                        ),
                         attr_list=[],
                         limit=1,
                     )
@@ -963,9 +893,7 @@ def main():
                 )
                 sys.exit()
         working_dir = args.working_dir if args.working_dir else os.getcwd()
-        print(
-            "Will synchronize %s at source to %s at destination" % (args.src, args.dest)
-        )
+        print(f"Will synchronize {args.src} at source to {args.dest} at destination")
         cluster_id = submit_parent_dag(
             working_dir,
             args.src,
@@ -975,7 +903,7 @@ def main():
             test_mode=args.test_mode,
             unique_id=args.unique_id,
         )
-        print("Parent job running in cluster %d" % cluster_id)
+        print(f"Parent job running in cluster {cluster_id}")
     elif args.cmd == "generate":
         logging.info("Generating file listing for %s", args.src)
         generate_file_listing(args.src, "source_manifest.txt", test_mode=args.test_mode)
