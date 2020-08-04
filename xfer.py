@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 """
 Utilize HTCondor to transfer / synchronize a directory from a source on an
@@ -11,47 +11,15 @@ import errno
 import hashlib
 import logging
 import os
-import re
 import sys
 import json
 import time
 from pathlib import Path
 
 import htcondor
+import htcondor.dags as dags
 
-
-PARENT_DAG = """
-# Gather the remote file listing.
-JOB CalculateWork calc_work.sub DIR calc_work
-
-# Gather the local file listing and write out the sub-DAG
-# to perform the actual transfers
-SCRIPT POST CalculateWork {exec_py} write_subdag {source_prefix} source_manifest.txt {dest_prefix} destination_manifest.txt {transfer_manifest} {requirements} {unique_id} {other_args}
-
-SUBDAG EXTERNAL DoXfers calc_work/do_work.dag
-SCRIPT POST DoXfers {exec_py} analyze {transfer_manifest}
-
-PARENT CalculateWork CHILD DoXfers
-"""
-
-CALC_WORK_JOB = """
-universe = vanilla
-executable = {exec_py}
-output = calc_work.out
-error = calc_work.err
-log = calc_work.log
-arguments = generate {source_dir} {other_args}
-should_transfer_files = YES
-transfer_output_files = source_manifest.txt
-requirements = {requirements}
-+IS_TRANSFER_JOB = true
-+UniqueId = "{unique_id}"
-+WantFlocking = true
-keep_claim_idle = 300
-request_disk = 1GB
-
-queue
-"""
+THIS_FILE = Path(__file__).absolute()
 
 XFER_FILE_JOB = """
 universe = vanilla
@@ -117,7 +85,7 @@ CATEGORY ALL_NODES TRANSFER_JOBS
 """
 
 DO_WORK_DAG_XFER_SNIPPET = """
-JOB xfer_{name} xfer_file.sub DIR calc_work
+JOB xfer_{name} xfer_file.sub
 VARS xfer_{name} src_file_noslash="{src_file_noslash}"
 VARS xfer_{name} src_file="{src_file}"
 VARS xfer_{name} dst_file="{dest}"
@@ -126,7 +94,7 @@ SCRIPT POST xfer_{name} {xfer_py} verify --json=xfer_commands_{fileidx}.json --f
 """
 
 DO_WORK_DAG_VERIFY_SNIPPET = """
-JOB verify_{name} verify_file.sub DIR calc_work
+JOB verify_{name} verify_file.sub
 VARS verify_{name} src_file_noslash="{src_file_noslash}"
 VARS verify_{name} src_file="{src_file}"
 VARS verify_{name} dst_file="{dest}"
@@ -249,45 +217,63 @@ def submit_parent_dag(
     unique_id=None,
 ):
     working_dir = Path(working_dir).absolute()
+    dest_dir = Path(dest_dir).absolute()
 
-    calc_work = working_dir / "calc_work"
-    calc_work.mkdir(parents=True, exist_ok=True)
+    transfer_manifest_path = dest_dir / "transfer_manifest.txt"
 
-    info = os.path.split(sys.argv[0])
-    full_exec_path = os.path.join(os.path.abspath(info[0]), info[1])
+    parent_dag = dags.DAG()
+
+    parent_dag.layer(
+        name="calc_work",
+        submit_description=htcondor.Submit(
+            {
+                "universe": "vanilla",
+                "executable": THIS_FILE.as_posix(),
+                "output": "calc_work.out",
+                "error": "calc_work.err",
+                "log": "calc_work.log",
+                "arguments": f"generate {source_dir} {'--test-mode' if test_mode else ''}",
+                "should_transfer_files": "yes",
+                "requirements": requirements if requirements is not None else "True",
+                "My.IsTransferJob": "vanilla",
+                "My.UniqueID": f"{unique_id if unique_id is not None else ''}",
+                "My.WantFlocking": "true",
+                "keep_claim_idle": "300",
+                "request_disk": "1GB",
+            }
+        ),
+        post=dags.Script(
+            executable=THIS_FILE,
+            arguments=[
+                "write_subdag",
+                source_dir,
+                "source_manifest.txt",
+                dest_dir,
+                "destination_manifest.txt",
+                transfer_manifest_path,
+                "--requirements_file=requirements.txt"
+                if requirements is not None
+                else "",
+                "--unique-id={}".format(unique_id) if unique_id is not None else "",
+                "--test-mode" if test_mode else "",
+            ],
+        ),
+    ).child_subdag(
+        name="do_work",
+        dag_file=working_dir / "do_work.dag",
+        post=dags.Script(
+            executable=THIS_FILE, arguments=["analyze", transfer_manifest_path]
+        ),
+    )
 
     if requirements:
-        (calc_work / "requirements.txt").write_text(requirements)
+        (working_dir / "requirements.txt").write_text(requirements)
 
-    calc_work_sub = calc_work / "calc_work.sub"
-    calc_work_sub.write_text(
-        CALC_WORK_JOB.format(
-            exec_py=full_exec_path,
-            source_dir=source_dir,
-            other_args="--test-mode" if test_mode else "",
-            requirements=requirements if requirements is not None else "True",
-            unique_id=unique_id if unique_id is not None else "",
-        )
+    parent_dag_file = dags.write_dag(
+        parent_dag, dag_dir=working_dir, dag_file_name="parent.dag"
     )
 
-    dag_file = working_dir / "xfer.dag"
-    dag_file.write_text(
-        PARENT_DAG.format(
-            exec_py=full_exec_path,
-            source_prefix=source_dir,
-            dest_prefix=dest_dir,
-            other_args="--test-mode" if test_mode else "",
-            transfer_manifest=os.path.join(dest_dir, "transfer_manifest.txt"),
-            requirements="--requirements_file=requirements.txt"
-            if requirements is not None
-            else "",
-            unique_id="--unique-id={}".format(unique_id)
-            if unique_id is not None
-            else "",
-        )
-    )
-
-    sub = htcondor.Submit.from_dag(str(dag_file))
+    sub = htcondor.Submit.from_dag(str(parent_dag_file))
 
     with change_dir(working_dir):
         schedd = htcondor.Schedd()
@@ -320,7 +306,7 @@ def parse_manifest(prefix, manifest, log_name):
                 fname = info["name"]
                 if "size" not in info:
                     raise Exception(
-                        "Manifest line missing 'size' key.  Currenty line: %s" % line
+                        "Manifest line missing 'size' key.  Current line: %s" % line
                     )
                 size = int(info["size"])
             else:
@@ -355,7 +341,7 @@ def write_subdag(
     test_mode=False,
     unique_id=None,
 ):
-    src_files = parse_manifest(source_prefix, Path(source_manifest), "Source")
+    src_files = parse_manifest(source_prefix, source_manifest, "Source")
 
     generate_file_listing(dest_prefix, "destination_manifest.txt")
     dest_files = parse_manifest(dest_prefix, "destination_manifest.txt", "Destination")
@@ -540,34 +526,32 @@ def xfer_exec(src):
         sys.exit(1)
 
     logging.info("About to copy %s to file0", src)
-    src_fd = open(src, "r")
-    dest_fd = open("file0", "w")
-    file_size = os.fstat(src_fd.fileno()).st_size
-    logging.info("There are %.2fMB to copy", file_size / 1024.0 / 1024.0)
-    last_log = time.time()
-    buf = src_fd.read(1024 * 1024)
-    hash_obj = hashlib.sha1()
-    byte_count = len(buf)
-    while len(buf) > 0:
-        hash_obj.update(buf)
-        dest_fd.write(buf)
-        buf = src_fd.read(1024 * 1024)
-        now = time.time()
-        if now - last_log > 5:
-            logging.info(
-                "Copied %.2f of %.2fMB; %.1f%% done",
-                byte_count / 1024.0 / 1024.0,
-                file_size / 1024.0 / 1024.0,
-                (byte_count / float(file_size)) * 100,
-            )
-            last_log = now
-        byte_count += len(buf)
 
-    src_fd.close()
-    logging.info("Copy complete; about to synchronize file to disk")
-    os.fsync(dest_fd.fileno())
-    logging.info("File synchronized to disk")
-    dest_fd.close()
+    with open(src, mode="rb") as src_fd, open("file0", mode="wb") as dest_fd:
+        file_size = os.fstat(src_fd.fileno()).st_size
+        logging.info("There are %.2fMB to copy", file_size / 1024.0 / 1024.0)
+        last_log = time.time()
+        buf = src_fd.read(1024 * 1024)
+        hash_obj = hashlib.sha1()
+        byte_count = len(buf)
+        while len(buf) > 0:
+            hash_obj.update(buf)
+            dest_fd.write(buf)
+            buf = src_fd.read(1024 * 1024)
+            now = time.time()
+            if now - last_log > 5:
+                logging.info(
+                    "Copied %.2f of %.2fMB; %.1f%% done",
+                    byte_count / 1024.0 / 1024.0,
+                    file_size / 1024.0 / 1024.0,
+                    (byte_count / float(file_size)) * 100,
+                )
+                last_log = now
+            byte_count += len(buf)
+
+        logging.info("Copy complete; about to synchronize file to disk")
+        os.fsync(dest_fd.fileno())
+        logging.info("File synchronized to disk")
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
     with open("metadata", "w") as metadata_fd:
@@ -581,28 +565,28 @@ def verify_remote(src):
         sys.exit(1)
 
     logging.info("About to verify %s", src)
-    src_fd = open(src, "r")
-    file_size = os.fstat(src_fd.fileno()).st_size
-    logging.info("There are %.2fMB to verify", file_size / 1024.0 / 1024.0)
-    last_log = time.time()
-    buf = src_fd.read(1024 * 1024)
-    hash_obj = hashlib.sha1()
-    byte_count = len(buf)
-    while len(buf) > 0:
-        hash_obj.update(buf)
-        buf = src_fd.read(1024 * 1024)
-        now = time.time()
-        if now - last_log > 5:
-            logging.info(
-                "Copied %.2f of %.2fMB; %.1f%% done",
-                byte_count / 1024.0 / 1024.0,
-                file_size / 1024.0 / 1024.0,
-                (byte_count / float(file_size)) * 100,
-            )
-            last_log = now
-        byte_count += len(buf)
 
-    src_fd.close()
+    with open(src, mode="rb") as src_fd:
+        file_size = os.fstat(src_fd.fileno()).st_size
+        logging.info("There are %.2fMB to verify", file_size / 1024.0 / 1024.0)
+        last_log = time.time()
+        buf = src_fd.read(1024 * 1024)
+        hash_obj = hashlib.sha1()
+        byte_count = len(buf)
+        while len(buf) > 0:
+            hash_obj.update(buf)
+            buf = src_fd.read(1024 * 1024)
+            now = time.time()
+            if now - last_log > 5:
+                logging.info(
+                    "Copied %.2f of %.2fMB; %.1f%% done",
+                    byte_count / 1024.0 / 1024.0,
+                    file_size / 1024.0 / 1024.0,
+                    (byte_count / float(file_size)) * 100,
+                )
+                last_log = now
+            byte_count += len(buf)
+
     logging.info("Checksum computation complete")
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
@@ -616,68 +600,63 @@ def verify(dest_prefix, dest, metadata, metadata_summary):
         if os.fstat(metadata_fd.fileno()).st_size > 16384:
             logging.error("Metadata file is too large")
             sys.exit(1)
-        contents = metadata_fd.read()
-        contents = contents.strip()
+
+        contents = metadata_fd.read().strip()
+
         if not contents:
             logging.error("Metadata file is empty")
             sys.exit(1)
-        if contents[0] == "{":
-            info = json.loads(contents)
-            if "name" not in info or "digest" not in info or "size" not in info:
-                logging.error("Metadata file format incorrect; missing keys")
-                sys.exit(1)
-            src_fname = info["name"]
-            src_hexdigest = info["digest"].encode("ascii")
-            src_size = int(info["size"])
-        else:
-            info = contents.strip().split()
-            if len(info) != 3:
-                logging.error("Metadata file format incorrect")
-                sys.exit(1)
-            src_fname = info[0]
-            src_hexdigest = info[1]
-            src_size = int(info[2])
+
+        info = json.loads(contents)
+
+        if any(key not in info for key in {"name", "digest", "size"}):
+            logging.error("Metadata file format incorrect; missing keys")
+            sys.exit(1)
+
+        src_fname = info["name"]
+        src_hexdigest = info["digest"]
+        src_size = int(info["size"])
 
     relative_fname = dest[len(dest_prefix) + 1 :]
 
     logging.info("About to verify contents of %s", dest)
-    dest_fd = open(dest, "r")
-    dest_size = os.fstat(dest_fd.fileno()).st_size
-    if src_size != dest_size:
-        logging.error(
-            "Copied file size (%d bytes) does not match source file size (%d bytes)",
-            dest_size,
-            src_size,
-        )
-        sys.exit(2)
-    logging.info("There are %.2fMB to verify", dest_size / 1024.0 / 1024.0)
-    last_log = time.time()
-    buf = dest_fd.read(1024 * 1024)
-    hash_obj = hashlib.sha1()
-    byte_count = len(buf)
-    while len(buf) > 0:
-        hash_obj.update(buf)
-        buf = dest_fd.read(1024 * 1024)
-        now = time.time()
-        if now - last_log > 5:
-            logging.info(
-                "Verified %.2f of %.2fMB; %.1f%% done",
-                byte_count / 1024.0 / 1024.0,
-                dest_size / 1024.0 / 1024.0,
-                (byte_count / float(dest_size)) * 100,
+    with open(dest, mode="rb") as dest_fd:
+        dest_size = os.fstat(dest_fd.fileno()).st_size
+        if src_size != dest_size:
+            logging.error(
+                "Copied file size (%d bytes) does not match source file size (%d bytes)",
+                dest_size,
+                src_size,
             )
-            last_log = now
-        byte_count += len(buf)
+            sys.exit(2)
+        logging.info("There are %.2fMB to verify", dest_size / 1024.0 / 1024.0)
+        last_log = time.time()
+        buf = dest_fd.read(1024 * 1024)
+        hash_obj = hashlib.sha1()
+        byte_count = len(buf)
+        while len(buf) > 0:
+            hash_obj.update(buf)
+            buf = dest_fd.read(1024 * 1024)
+            now = time.time()
+            if now - last_log > 5:
+                logging.info(
+                    "Verified %.2f of %.2fMB; %.1f%% done",
+                    byte_count / 1024.0 / 1024.0,
+                    dest_size / 1024.0 / 1024.0,
+                    (byte_count / float(dest_size)) * 100,
+                )
+                last_log = now
+            byte_count += len(buf)
 
-    dest_fd.close()
-    if src_hexdigest != hash_obj.hexdigest():
+    dest_hexdigest = hash_obj.hexdigest()
+    if src_hexdigest != dest_hexdigest:
         logging.info(
             "Destination file (%s) has incorrect SHA1 digest of %s, which does not match"
             " source file %s (digest %s)",
             dest,
+            dest_hexdigest,
             src_hexdigest,
             src_fname,
-            hash_obj.hexdigest(),
         )
         sys.exit(1)
     else:
@@ -868,78 +847,91 @@ def analyze(transfer_manifest):
 
 
 def main():
-    logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
+    out = Path("/home/jtk/projects/htcondor_file_transfer") / "xfer.out"
+    with out.open(mode="a") as f, contextlib.redirect_stdout(
+        f
+    ), contextlib.redirect_stderr(f):
+        try:
+            logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
 
-    args = parse_args()
+            args = parse_args()
 
-    if args.cmd == "sync":
-        if args.unique_id:
-            schedd = htcondor.Schedd()
-            if (
-                len(
-                    schedd.query(
-                        constraint='UniqueId == "{}" && JobStatus =!= 4'.format(
-                            args.unique_id
-                        ),
-                        attr_list=[],
-                        limit=1,
-                    )
+            print(f"Called with args: {args}")
+
+            if args.cmd == "sync":
+                if args.unique_id:
+                    schedd = htcondor.Schedd()
+                    if (
+                        len(
+                            schedd.query(
+                                constraint='UniqueId == "{}" && JobStatus =!= 4'.format(
+                                    args.unique_id
+                                ),
+                                attr_list=[],
+                                limit=1,
+                            )
+                        )
+                        > 0
+                    ):
+                        logging.warning(
+                            'Jobs already found in queue with UniqueId == "%s", exiting',
+                            args.unique_id,
+                        )
+                        sys.exit()
+                working_dir = args.working_dir if args.working_dir else os.getcwd()
+                print(
+                    f"Will synchronize {args.src} at source to {args.dest} at destination"
                 )
-                > 0
-            ):
-                logging.warning(
-                    'Jobs already found in queue with UniqueId == "%s", exiting',
-                    args.unique_id,
+                cluster_id = submit_parent_dag(
+                    working_dir,
+                    args.src,
+                    os.path.abspath(args.dest),
+                    requirements=read_requirements_file(args.requirements_file)
+                    or args.requirements,
+                    test_mode=args.test_mode,
+                    unique_id=args.unique_id,
                 )
-                sys.exit()
-        working_dir = args.working_dir if args.working_dir else os.getcwd()
-        print(f"Will synchronize {args.src} at source to {args.dest} at destination")
-        cluster_id = submit_parent_dag(
-            working_dir,
-            args.src,
-            os.path.abspath(args.dest),
-            requirements=read_requirements_file(args.requirements_file)
-            or args.requirements,
-            test_mode=args.test_mode,
-            unique_id=args.unique_id,
-        )
-        print(f"Parent job running in cluster {cluster_id}")
-    elif args.cmd == "generate":
-        logging.info("Generating file listing for %s", args.src)
-        generate_file_listing(args.src, "source_manifest.txt", test_mode=args.test_mode)
-    elif args.cmd == "write_subdag":
-        logging.info(
-            "Generating SUBGDAG for transfer of %s->%s",
-            args.source_prefix,
-            args.dest_prefix,
-        )
-        write_subdag(
-            args.source_prefix,
-            args.source_manifest,
-            args.dest_prefix,
-            args.dest_manifest,
-            args.transfer_manifest,
-            requirements=read_requirements_file(args.requirements_file)
-            or args.requirements,
-            test_mode=args.test_mode,
-            unique_id=args.unique_id,
-        )
-    elif args.cmd == "exec":
-        xfer_exec(args.src)
-    elif args.cmd == "verify":
-        with open(args.json, "r") as fp:
-            cmd_info = json.load(fp)
-        info = cmd_info[args.fileid]
-        verify(
-            info["dest_prefix"],
-            info["dest"],
-            "{}.metadata".format(info["src_file_noslash"]),
-            info["transfer_manifest"],
-        )
-    elif args.cmd == "verify_remote":
-        verify_remote(args.src)
-    elif args.cmd == "analyze":
-        analyze(args.transfer_manifest)
+                print(f"Parent job running in cluster {cluster_id}")
+            elif args.cmd == "generate":
+                logging.info("Generating file listing for %s", args.src)
+                generate_file_listing(
+                    args.src, "source_manifest.txt", test_mode=args.test_mode
+                )
+            elif args.cmd == "write_subdag":
+                logging.info(
+                    "Generating SUBGDAG for transfer of %s->%s",
+                    args.source_prefix,
+                    args.dest_prefix,
+                )
+                write_subdag(
+                    args.source_prefix,
+                    args.source_manifest,
+                    args.dest_prefix,
+                    args.dest_manifest,
+                    args.transfer_manifest,
+                    requirements=read_requirements_file(args.requirements_file)
+                    or args.requirements,
+                    test_mode=args.test_mode,
+                    unique_id=args.unique_id,
+                )
+            elif args.cmd == "exec":
+                xfer_exec(args.src)
+            elif args.cmd == "verify":
+                with open(args.json, "r") as fp:
+                    cmd_info = json.load(fp)
+                info = cmd_info[args.fileid]
+                verify(
+                    info["dest_prefix"],
+                    info["dest"],
+                    "{}.metadata".format(info["src_file_noslash"]),
+                    info["transfer_manifest"],
+                )
+            elif args.cmd == "verify_remote":
+                verify_remote(args.src)
+            elif args.cmd == "analyze":
+                analyze(args.transfer_manifest)
+        except Exception:
+            logging.exception("woops")
 
 
 if __name__ == "__main__":
