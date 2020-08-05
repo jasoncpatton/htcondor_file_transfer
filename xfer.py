@@ -29,7 +29,7 @@ TB = 2 ** 40
 METADATA_FILE_SIZE_LIMIT = 16 * KB
 SANDBOX_FILE_NAME = "file-for-xfer"
 
-THIS_FILE = Path(__file__).absolute()
+THIS_FILE = Path(__file__).resolve()
 
 K = TypeVar("K")
 V = TypeVar("V")
