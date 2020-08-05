@@ -14,6 +14,7 @@ import sys
 import json
 import time
 from pathlib import Path
+from typing import Iterator, Optional, Mapping, TypeVar, Dict, List
 
 import htcondor
 import htcondor.dags as dags
@@ -30,101 +31,18 @@ SANDBOX_FILE_NAME = "file-for-xfer"
 
 THIS_FILE = Path(__file__).absolute()
 
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="cmd")
-
-    sync = subparsers.add_parser("sync")
-    sync.add_argument("src")
-    sync.add_argument("dest")
-    sync.add_argument(
-        "--working-dir",
-        help="Directory to place working HTCondor files.",
-        default="./scratch_dir",
-        dest="working_dir",
-    )
-    sync.add_argument(
-        "--requirements",
-        help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')",
-    )
-    sync.add_argument(
-        "--requirements_file", help="File containing submit file requirements"
-    )
-    sync.add_argument(
-        "--unique-id",
-        help="Do not submit if jobs with UniqueId already found in queue",
-        dest="unique_id",
-    )
-    sync.add_argument(
-        "--test-mode",
-        help="Testing mode (only transfers small files)",
-        default=False,
-        action="store_true",
-        dest="test_mode",
-    )
-
-    generate = subparsers.add_parser("generate")
-    generate.add_argument("src")
-    generate.add_argument(
-        "--test-mode",
-        help="Testing mode (only transfers small files)",
-        default=False,
-        action="store_true",
-        dest="test_mode",
-    )
-
-    subdag = subparsers.add_parser("write_subdag")
-    subdag.add_argument("source_prefix")
-    subdag.add_argument("source_manifest")
-    subdag.add_argument("dest_prefix")
-    subdag.add_argument("dest_manifest")
-    subdag.add_argument("transfer_manifest")
-    subdag.add_argument("--requirements", help="Submit file requirements")
-    subdag.add_argument(
-        "--requirements_file", help="File containing submit file requirements"
-    )
-    subdag.add_argument(
-        "--unique-id", help="Set UniqueId in submitted jobs", dest="unique_id"
-    )
-    subdag.add_argument(
-        "--test-mode",
-        help="Testing mode (only transfers small files)",
-        default=False,
-        action="store_true",
-        dest="test_mode",
-    )
-
-    exec = subparsers.add_parser("exec")
-    exec.add_argument("src")
-
-    verify_remote = subparsers.add_parser("verify_remote")
-    verify_remote.add_argument("src")
-
-    verify = subparsers.add_parser("verify")
-    # SCRIPT POST xfer_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
-    # verify.add_argument("dest_prefix")
-    # verify.add_argument("dest")
-    # verify.add_argument("metadata")
-    # verify.add_argument("metadata_summary")
-    verify.add_argument("--json", dest="json")
-    verify.add_argument("--fileid", dest="fileid")
-
-    analyze = subparsers.add_parser("analyze")
-    analyze.add_argument("transfer_manifest")
-
-    return parser.parse_args()
+K = TypeVar("K")
+V = TypeVar("V")
 
 
-def read_requirements_file(requirements_file):
+def read_requirements_file(requirements_file: Optional[Path]) -> Optional[str]:
     if requirements_file is None:
         return None
 
-    return Path(requirements_file).read_text().strip()
+    return requirements_file.read_text().strip()
 
 
-def generate_file_listing(src, manifest_path, test_mode=False):
-    manifest_path = Path(manifest_path)
+def generate_file_listing(src: Path, manifest_path: Path, test_mode: bool = False):
     with manifest_path.open(mode="w") as f:
         for entry in walk(src):
             size = entry.stat().st_size
@@ -136,7 +54,7 @@ def generate_file_listing(src, manifest_path, test_mode=False):
             f.write(f"{json.dumps(info)}\n")
 
 
-def walk(path):
+def walk(path: Path) -> Iterator[os.DirEntry]:
     for entry in os.scandir(path):
         if entry.is_dir():
             yield from walk(entry.path)
@@ -144,34 +62,70 @@ def walk(path):
             yield entry
 
 
-def shared_job_descriptors(unique_id, requirements):
+def shared_submit_descriptors(unique_id=None, requirements=None):
     return {
         "executable": THIS_FILE.as_posix(),
         "My.IsTransferJob": "true",
-        "requirements": requirements if requirements is not None else "true",
-        "My.UniqueID": f"{classad.quote(unique_id) if unique_id is not None else ''}",
         "My.WantFlocking": "true",
         "keep_claim_idle": "300",
         "request_disk": "1GB",
+        "on_exit_hold": "ExitCode =!= 0",
+        "requirements": requirements if requirements is not None else "true",
+        "My.UniqueID": f"{classad.quote(unique_id) if unique_id is not None else ''}",
     }
 
 
-def submit_parent_dag(
-    working_dir,
-    source_dir,
-    dest_dir,
-    requirements=None,
-    test_mode=False,
-    unique_id=None,
+def submit_outer_dag(
+    working_dir: Path,
+    source_dir: Path,
+    dest_dir: Path,
+    requirements: Optional[str] = None,
+    unique_id: Optional[str] = None,
+    test_mode: bool = False,
 ):
-    working_dir = Path(working_dir).absolute()
-    dest_dir = Path(dest_dir).absolute()
+    working_dir = working_dir.resolve()
+    dest_dir = dest_dir.resolve()
+    source_dir = source_dir.resolve()
 
     transfer_manifest_path = dest_dir / "transfer_manifest.txt"
 
-    parent_dag = dags.DAG()
+    outer_dag = make_outer_dag(
+        dest_dir,
+        requirements,
+        source_dir,
+        test_mode,
+        transfer_manifest_path,
+        unique_id,
+        working_dir,
+    )
 
-    parent_dag.layer(
+    if requirements:
+        (working_dir / "requirements.txt").write_text(requirements)
+
+    outer_dag_file = dags.write_dag(
+        outer_dag, dag_dir=working_dir, dag_file_name="outer.dag"
+    )
+
+    sub = htcondor.Submit.from_dag(str(outer_dag_file))
+
+    with change_dir(working_dir):
+        schedd = htcondor.Schedd()
+        with schedd.transaction() as txn:
+            return sub.queue(txn)
+
+
+def make_outer_dag(
+    dest_dir,
+    requirements,
+    source_dir,
+    test_mode,
+    transfer_manifest_path,
+    unique_id,
+    working_dir,
+):
+    outer_dag = dags.DAG()
+
+    outer_dag.layer(
         name="calc_work",
         submit_description=htcondor.Submit(
             {
@@ -180,7 +134,7 @@ def submit_parent_dag(
                 "log": "calc_work.log",
                 "arguments": f"generate {source_dir} {'--test-mode' if test_mode else ''}",
                 "should_transfer_files": "yes",
-                **shared_job_descriptors(unique_id, requirements),
+                **shared_submit_descriptors(unique_id, requirements),
             }
         ),
         post=dags.Script(
@@ -207,19 +161,7 @@ def submit_parent_dag(
         ),
     )
 
-    if requirements:
-        (working_dir / "requirements.txt").write_text(requirements)
-
-    outer_dag_file = dags.write_dag(
-        parent_dag, dag_dir=working_dir, dag_file_name="outer.dag"
-    )
-
-    sub = htcondor.Submit.from_dag(str(outer_dag_file), {"force": 1})
-
-    with change_dir(working_dir):
-        schedd = htcondor.Schedd()
-        with schedd.transaction() as txn:
-            return sub.queue(txn)
+    return outer_dag
 
 
 @contextlib.contextmanager
@@ -230,9 +172,8 @@ def change_dir(dir):
     os.chdir(original)
 
 
-def parse_manifest(prefix, manifest_path, log_name):
-    manifest_path = Path(manifest_path)
-    prefix = os.path.normpath(prefix)
+def parse_manifest(prefix: Path, manifest_path: Path, log_name):
+    prefix = str(prefix.resolve())
     files = {}
     with manifest_path.open(mode="r") as fd:
         for line in fd:
@@ -275,20 +216,20 @@ def parse_manifest(prefix, manifest_path, log_name):
     return files
 
 
-def write_subdag(
-    source_prefix,
-    source_manifest,
-    dest_prefix,
-    dest_manifest,
-    transfer_manifest_path,
+def write_inner_dag(
+    source_prefix: Path,
+    source_manifest: Path,
+    dest_prefix: Path,
     requirements=None,
-    test_mode=False,
+    test_mode: bool = False,
     unique_id=None,
 ):
     src_files = parse_manifest(source_prefix, source_manifest, "Source")
 
-    generate_file_listing(dest_prefix, "destination_manifest.txt")
-    dest_files = parse_manifest(dest_prefix, "destination_manifest.txt", "Destination")
+    generate_file_listing(dest_prefix, Path("destination_manifest.txt"))
+    dest_files = parse_manifest(
+        dest_prefix, Path("destination_manifest.txt"), "Destination"
+    )
 
     files_to_xfer = set()
     for fname in src_files:
@@ -327,104 +268,25 @@ def write_subdag(
         if fname not in files_verified:
             files_to_verify.add(fname)
 
-    inner_dag = dags.DAG(
-        max_jobs_by_category={"TRANSFER_JOBS": 1} if test_mode else None
+    ensure_destination_dirs_exist(dest_prefix, files_to_xfer)
+
+    xfer_cmd_info = make_cmd_info(
+        files_to_xfer, source_prefix, dest_prefix, transfer_manifest_path
+    )
+    verify_cmd_info = make_cmd_info(
+        files_to_verify, source_prefix, dest_prefix, transfer_manifest_path
     )
 
-    dest_dirs = set()
-    cmd_info = []
-    for idx, fname in enumerate(sorted(files_to_xfer)):
-        src_file = os.path.join(source_prefix, fname)
-        src_file_noslash = flatten_path(fname)
-        dest = os.path.join(dest_prefix, fname)
-        dest_dirs.add(os.path.split(dest)[0])
+    write_cmd_info(xfer_cmd_info, Path("xfer_commands.json"))
+    write_cmd_info(verify_cmd_info, Path("verify_commands.json"))
 
-        logging.info("File transfer to perform: %s->%s", src_file, dest)
-
-        info = {
-            "src_file": src_file,
-            "src_file_noslash": src_file_noslash,
-            "dest": dest,
-            "transfer_manifest": str(transfer_manifest_path),
-            "dest_prefix": dest_prefix,
-        }
-        cmd_info.append(info)
-
-    with open("xfer_commands.json", "w") as cmd_fp:
-        json.dump(dict(enumerate(map(values_to_strings, cmd_info))), cmd_fp)
-
-    inner_dag.layer(
-        name="xfer",
-        submit_description=htcondor.Submit(
-            {
-                "output": "$(src_file_noslash).out",
-                "error": "$(src_file_noslash).err",
-                "log": "xfer_file.log",
-                "arguments": classad.quote("exec '$(src_file)'"),
-                "should_transfer_files": "yes",
-                "transfer_output_files": f"{SANDBOX_FILE_NAME}, metadata",
-                "transfer_output_remaps": classad.quote(
-                    f"{SANDBOX_FILE_NAME} = $(dest); metadata = $(src_file_noslash).metadata"
-                ),
-                **shared_job_descriptors(unique_id, requirements),
-            }
-        ),
-        vars=cmd_info,
-        post=dags.Script(
-            executable=THIS_FILE,
-            arguments=["verify", "--json=xfer_commands.json", "--fileid", "$JOB"],
-        ),
-    )
-
-    cmd_info = []
-    for fname in files_to_verify:
-        src_file = os.path.join(source_prefix, fname)
-        src_file_noslash = flatten_path(fname)
-        dest = os.path.join(dest_prefix, fname)
-
-        logging.info("File to verify: %s", src_file)
-
-        info = {
-            "src_file": src_file,
-            "src_file_noslash": src_file_noslash,
-            "dest": dest,
-            "transfer_manifest": transfer_manifest_path,
-            "dest_prefix": dest_prefix,
-        }
-        cmd_info.append(info)
-
-    with open("verify_commands.json", "w") as cmd_fp:
-        json.dump(dict(enumerate(map(values_to_strings, cmd_info))), cmd_fp)
-
-    inner_dag.layer(
-        name="verify",
-        submit_description=htcondor.Submit(
-            {
-                "output": "$(src_file_noslash).out",
-                "error": "$(src_file_noslash).err",
-                "log": "verify_file.log",
-                "arguments": classad.quote(f"verify_remote '$(src_file)'"),
-                "should_transfer_files": "yes",
-                "transfer_output_files": "metadata",
-                "transfer_output_remaps": classad.quote(
-                    "metadata = $(src_file_noslash).metadata"
-                ),
-                **shared_job_descriptors(unique_id, requirements),
-            }
-        ),
-        vars=cmd_info,
-        post=dags.Script(
-            executable=THIS_FILE,
-            arguments=["verify", "--json=verify_commands.json", "--fileid", "$JOB"],
-        ),
+    inner_dag = make_inner_dag(
+        requirements, xfer_cmd_info, verify_cmd_info, unique_id, test_mode
     )
 
     print(inner_dag.describe())
 
     dags.write_dag(inner_dag, dag_dir=Path.cwd(), dag_file_name="inner.dag")
-
-    for dest_dir in dest_dirs:
-        Path(dest_dir).mkdir(exist_ok=True, parents=True)
 
     bytes_to_transfer = sum(src_files[fname] for fname in files_to_xfer)
     bytes_to_verify = sum(src_files[fname] for fname in files_to_verify)
@@ -441,17 +303,113 @@ def write_subdag(
             f.write("VERIFY_REQUEST {}\n".format(json.dumps(info)))
 
 
-def flatten_path(path):
+def ensure_destination_dirs_exist(dest_prefix, files_to_xfer):
+    dest_dirs = set()
+    for idx, fname in enumerate(sorted(files_to_xfer)):
+        dest = os.path.join(dest_prefix, fname)
+        dest_dirs.add(os.path.split(dest)[0])
+
+    for dest_dir in dest_dirs:
+        Path(dest_dir).mkdir(exist_ok=True, parents=True)
+
+
+T_CMD_INFO = List[Mapping[str, Path]]
+
+
+def make_cmd_info(files, source_prefix, dest_prefix, transfer_manifest_path):
+    cmd_info = []
+
+    for fname in files:
+        src_file = os.path.join(source_prefix, fname)
+        src_file_noslash = flatten_path(fname)
+        dest = os.path.join(dest_prefix, fname)
+
+        info = {
+            "src_file": src_file,
+            "src_file_noslash": src_file_noslash,
+            "dest": dest,
+            "transfer_manifest": transfer_manifest_path,
+            "dest_prefix": dest_prefix,
+        }
+        cmd_info.append(info)
+
+    return cmd_info
+
+
+def write_cmd_info(cmd_info: T_CMD_INFO, path: Path):
+    with path.open("w") as cmd_fp:
+        json.dump(dict(enumerate(map(values_to_strings, cmd_info))), cmd_fp)
+
+
+def flatten_path(path: Path) -> str:
     return str(path).replace("/", "_SLASH_").replace(" ", "_SPACE_")
 
 
-def values_to_strings(mapping):
+def values_to_strings(mapping: Mapping[K, V]) -> Dict[K, str]:
     return {k: str(v) for k, v in mapping.items()}
 
 
-def xfer_exec(src_path):
-    src_path = Path(src_path)
+def make_inner_dag(
+    requirements: Optional[str],
+    xfer_cmd_info: T_CMD_INFO,
+    verify_cmd_info: T_CMD_INFO,
+    unique_id: Optional[str] = None,
+    test_mode: bool = False,
+) -> dags.DAG:
+    inner_dag = dags.DAG(
+        max_jobs_by_category={"TRANSFER_JOBS": 1} if test_mode else None
+    )
 
+    inner_dag.layer(
+        name="xfer",
+        submit_description=htcondor.Submit(
+            {
+                "output": "$(src_file_noslash).out",
+                "error": "$(src_file_noslash).err",
+                "log": "xfer_file.log",
+                "arguments": classad.quote("exec '$(src_file)'"),
+                "should_transfer_files": "yes",
+                "transfer_output_files": f"{SANDBOX_FILE_NAME}, metadata",
+                "transfer_output_remaps": classad.quote(
+                    f"{SANDBOX_FILE_NAME} = $(dest); metadata = $(src_file_noslash).metadata"
+                ),
+                **shared_submit_descriptors(unique_id, requirements),
+            }
+        ),
+        vars=xfer_cmd_info,
+        post=dags.Script(
+            executable=THIS_FILE,
+            arguments=["verify", "--json=xfer_commands.json", "--fileid", "$JOB"],
+        ),
+    )
+
+    inner_dag.layer(
+        name="verify",
+        submit_description=htcondor.Submit(
+            {
+                "output": "$(src_file_noslash).out",
+                "error": "$(src_file_noslash).err",
+                "log": "verify_file.log",
+                "arguments": classad.quote(f"verify_remote '$(src_file)'"),
+                "should_transfer_files": "yes",
+                "transfer_output_files": "metadata",
+                "transfer_output_remaps": classad.quote(
+                    "metadata = $(src_file_noslash).metadata"
+                ),
+                **shared_submit_descriptors(unique_id, requirements),
+            }
+        ),
+        vars=verify_cmd_info,
+        post=dags.Script(
+            executable=THIS_FILE,
+            arguments=["verify", "--json=verify_commands.json", "--fileid", "$JOB"],
+        ),
+    )
+
+    return inner_dag
+
+
+def xfer_exec(src_path: Path):
     if "_CONDOR_JOB_AD" not in os.environ:
         print("This executable must be run within the HTCondor runtime environment.")
         sys.exit(1)
@@ -496,13 +454,13 @@ def xfer_exec(src_path):
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
 
-    with open("metadata", "w") as metadata_fd:
+    with Path("metadata").open(mode="w") as metadata:
         info = {
             "name": str(src_path),
             "digest": hash_obj.hexdigest(),
             "size": byte_count,
         }
-        metadata_fd.write("{}\n".format(json.dumps(info)))
+        metadata.write("{}\n".format(json.dumps(info)))
 
 
 def verify_remote(src):
@@ -543,21 +501,12 @@ def verify_remote(src):
 
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
 
-    with open("metadata", "w") as metadata_fd:
+    with Path("metadata").open(mode="w") as metadata:
         info = {"name": str(src), "digest": hash_obj.hexdigest(), "size": byte_count}
-        metadata_fd.write(f"{json.dumps(info)}\n")
+        metadata.write(f"{json.dumps(info)}\n")
 
 
-def valid_metadata(metadata):
-    return all(key in metadata for key in {"name", "digest", "size"})
-
-
-def verify(dest_prefix, dest, metadata_path, metadata_summary):
-    dest_prefix = Path(dest_prefix)
-    dest = Path(dest)
-    metadata_path = Path(metadata_path)
-    metadata_summary = Path(metadata_summary)
-
+def verify(dest_prefix: Path, dest: Path, metadata_path: Path, metadata_summary: Path):
     if metadata_path.stat().st_size > 16384:
         logging.error("Metadata file is too large")
         sys.exit(1)
@@ -657,144 +606,145 @@ def verify(dest_prefix, dest, metadata_path, metadata_summary):
             err_file.unlink()
 
 
-def analyze(transfer_manifest):
-    transfer_manifest = Path(transfer_manifest)
+def valid_metadata(metadata) -> bool:
+    return all(key in metadata for key in {"name", "digest", "size"})
 
+
+def analyze(transfer_manifest: Path):
     sync_request_start = None
     sync_request = {"files": {}, "xfer_files": set(), "verified_files": {}}
     dest_dir = os.path.abspath(os.path.split(transfer_manifest)[0])
     sync_count = 0
 
-    with open(transfer_manifest, "r") as fp:
-        for idx, line in enumerate(transfer_manifest.open(mode="r")):
-            info = line.strip().split()
-            # Format: SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}
-            if info[0] == "SYNC_REQUEST":
-                sync_count += 1
-                # if sync_request_start is not None:
-                #    logging.error("Sync request started at line %d but never finished; inconsistent log",
-                #        sync_request_start)
-                #    sys.exit(4)
-                sync_request_start = idx
-                for entry in info[2:]:
-                    key, val = entry.split("=")
-                    if key == "timestamp":
-                        continue
-                    sync_request[key] = int(val)
-            # Format: TRANSFER_REQUEST fname size
-            elif info[0] == "TRANSFER_REQUEST" or info[0] == "VERIFY_REQUEST":
-                if sync_request_start is None:
-                    logging.error(
-                        "Transfer request found at line %d before sync started; inconsistent log",
-                        idx,
-                    )
-                    sys.exit(4)
-
-                local_info = json.loads(" ".join(info[1:]))
-                size = int(local_info["size"])
-                fname = local_info["name"]
-
-                # File was previously verified.
-                if sync_request["verified_files"].get(fname, None) == size:
+    for idx, line in enumerate(transfer_manifest.open(mode="r")):
+        info = line.strip().split()
+        # Format: SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}
+        if info[0] == "SYNC_REQUEST":
+            sync_count += 1
+            # if sync_request_start is not None:
+            #    logging.error("Sync request started at line %d but never finished; inconsistent log",
+            #        sync_request_start)
+            #    sys.exit(4)
+            sync_request_start = idx
+            for entry in info[2:]:
+                key, val = entry.split("=")
+                if key == "timestamp":
                     continue
-                sync_request["files"][fname] = size
-                if info[0] == "TRANSFER_REQUEST":
-                    if info[1][0] == "{":
-                        local_info = json.loads(" ".join(info[1:]))
-                        sync_request["xfer_files"].add(local_info["name"])
-                    else:
-                        sync_request["xfer_files"].add(info[1])
-            # Format: TRANSFER_VERIFIED relative_fname hexdigest size timestamp:
-            elif info[0] == "TRANSFER_VERIFIED":
-                if sync_request_start is None:
-                    logging.error(
-                        "Transfer verification found at line %d before sync started; inconsistent log",
-                        idx,
-                    )
-                    sys.exit(4)
+                sync_request[key] = int(val)
+        # Format: TRANSFER_REQUEST fname size
+        elif info[0] == "TRANSFER_REQUEST" or info[0] == "VERIFY_REQUEST":
+            if sync_request_start is None:
+                logging.error(
+                    "Transfer request found at line %d before sync started; inconsistent log",
+                    idx,
+                )
+                sys.exit(4)
 
-                local_info = json.loads(" ".join(info[1:]))
-                fname = local_info["name"]
-                size = int(local_info["size"])
+            local_info = json.loads(" ".join(info[1:]))
+            size = int(local_info["size"])
+            fname = local_info["name"]
 
-                if sync_request["verified_files"].get(fname, None) == size:
-                    continue
-
-                if fname not in sync_request["files"]:
-                    logging.error("File %s verified but was not requested.", fname)
-                    sys.exit(4)
-                if sync_request["files"][fname] != size:
-                    logging.error(
-                        "Verified file size %d of %s is different than anticipated",
-                        size,
-                        fname,
-                        sync_request["files"][fname],
-                    )
-                    sys.exit(4)
-                try:
-                    local_size = os.stat(os.path.join(dest_dir, fname)).st_size
-                except OSError as oe:
-                    logging.error("Unable to verify size of %s: %s", fname, str(oe))
-                    sys.exit(4)
-                if local_size != size:
-                    logging.error(
-                        "Local size of %d of %s does not match anticipated size %d.",
-                        local_size,
-                        fname,
-                        size,
-                    )
-                    sys.exit(4)
-                if fname in sync_request["xfer_files"]:
-                    sync_request["files_to_transfer"] -= 1
-                    sync_request["bytes_to_transfer"] -= size
+            # File was previously verified.
+            if sync_request["verified_files"].get(fname, None) == size:
+                continue
+            sync_request["files"][fname] = size
+            if info[0] == "TRANSFER_REQUEST":
+                if info[1][0] == "{":
+                    local_info = json.loads(" ".join(info[1:]))
+                    sync_request["xfer_files"].add(local_info["name"])
                 else:
-                    sync_request["files_to_verify"] -= 1
-                    sync_request["bytes_to_verify"] -= size
-                del sync_request["files"][fname]
-                sync_request["verified_files"][fname] = size
-            elif info[0] == "SYNC_DONE":
-                if sync_request_start is None:
-                    logging.error(
-                        "Transfer request found at line %d before sync started; inconsistent log",
-                        idx,
-                    )
-                    sys.exit(4)
+                    sync_request["xfer_files"].add(info[1])
+        # Format: TRANSFER_VERIFIED relative_fname hexdigest size timestamp:
+        elif info[0] == "TRANSFER_VERIFIED":
+            if sync_request_start is None:
+                logging.error(
+                    "Transfer verification found at line %d before sync started; inconsistent log",
+                    idx,
+                )
+                sys.exit(4)
 
-                if (
-                    sync_request["files_to_verify"]
-                    or sync_request["bytes_to_verify"]
-                    or sync_request["files"]
-                    or sync_request["files_to_transfer"]
-                    or sync_request["bytes_to_transfer"]
-                ):
-                    logging.error(
-                        "SYNC_DONE but there is work remaining: %s", str(sync_request)
-                    )
-                    sys.exit(4)
+            local_info = json.loads(" ".join(info[1:]))
+            fname = local_info["name"]
+            size = int(local_info["size"])
 
-                sync_request_start = None
-                sync_request = {"files": {}, "xfer_files": set(), "verified_files": {}}
+            if sync_request["verified_files"].get(fname, None) == size:
+                continue
 
-        if sync_request_start is not None and (
-            sync_request["files_to_verify"]
-            or sync_request["bytes_to_verify"]
-            or sync_request["files"]
-            or sync_request["files_to_transfer"]
-            or sync_request["bytes_to_transfer"]
-        ):
-            logging.error("Sync not done! Work remaining.")
-            logging.error(
-                "- Files to transfer: %s (bytes %d)",
-                sync_request["files_to_transfer"],
-                sync_request["bytes_to_transfer"],
-            )
-            logging.error(
-                "- Files to verify: %s (bytes %d)",
-                sync_request["files_to_verify"],
-                sync_request["bytes_to_verify"],
-            )
-            logging.error("Inconsistent files: {}".format(str(sync_request["files"])))
-            sys.exit(4)
+            if fname not in sync_request["files"]:
+                logging.error("File %s verified but was not requested.", fname)
+                sys.exit(4)
+            if sync_request["files"][fname] != size:
+                logging.error(
+                    "Verified file size %d of %s is different than anticipated",
+                    size,
+                    fname,
+                    sync_request["files"][fname],
+                )
+                sys.exit(4)
+            try:
+                local_size = os.stat(os.path.join(dest_dir, fname)).st_size
+            except OSError as oe:
+                logging.error("Unable to verify size of %s: %s", fname, str(oe))
+                sys.exit(4)
+            if local_size != size:
+                logging.error(
+                    "Local size of %d of %s does not match anticipated size %d.",
+                    local_size,
+                    fname,
+                    size,
+                )
+                sys.exit(4)
+            if fname in sync_request["xfer_files"]:
+                sync_request["files_to_transfer"] -= 1
+                sync_request["bytes_to_transfer"] -= size
+            else:
+                sync_request["files_to_verify"] -= 1
+                sync_request["bytes_to_verify"] -= size
+            del sync_request["files"][fname]
+            sync_request["verified_files"][fname] = size
+        elif info[0] == "SYNC_DONE":
+            if sync_request_start is None:
+                logging.error(
+                    "Transfer request found at line %d before sync started; inconsistent log",
+                    idx,
+                )
+                sys.exit(4)
+
+            if (
+                sync_request["files_to_verify"]
+                or sync_request["bytes_to_verify"]
+                or sync_request["files"]
+                or sync_request["files_to_transfer"]
+                or sync_request["bytes_to_transfer"]
+            ):
+                logging.error(
+                    "SYNC_DONE but there is work remaining: %s", str(sync_request)
+                )
+                sys.exit(4)
+
+            sync_request_start = None
+            sync_request = {"files": {}, "xfer_files": set(), "verified_files": {}}
+
+    if sync_request_start is not None and (
+        sync_request["files_to_verify"]
+        or sync_request["bytes_to_verify"]
+        or sync_request["files"]
+        or sync_request["files_to_transfer"]
+        or sync_request["bytes_to_transfer"]
+    ):
+        logging.error("Sync not done! Work remaining.")
+        logging.error(
+            "- Files to transfer: %s (bytes %d)",
+            sync_request["files_to_transfer"],
+            sync_request["bytes_to_transfer"],
+        )
+        logging.error(
+            "- Files to verify: %s (bytes %d)",
+            sync_request["files_to_verify"],
+            sync_request["bytes_to_verify"],
+        )
+        logging.error("Inconsistent files: {}".format(str(sync_request["files"])))
+        sys.exit(4)
 
     if sync_request_start is not None:
         with transfer_manifest.open(mode="a") as f:
@@ -805,6 +755,89 @@ def analyze(transfer_manifest):
     else:
         logging.error("No synchronization found in manifest.")
         sys.exit(1)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="cmd")
+
+    sync = subparsers.add_parser("sync")
+    sync.add_argument("src", type=Path)
+    sync.add_argument("dest", type=Path)
+    default_working_dir = Path.cwd() / "xfer_working_dir"
+    sync.add_argument(
+        "--working-dir",
+        help="Directory to place working HTCondor files.",
+        type=Path,
+        default=default_working_dir,
+        dest="working_dir",
+    )
+    sync.add_argument(
+        "--requirements",
+        help="Submit file requirements (e.g. 'UniqueName == \"MyLab0001\"')",
+    )
+    sync.add_argument(
+        "--requirements_file",
+        help="File containing submit file requirements",
+        type=Path,
+    )
+    sync.add_argument(
+        "--unique-id",
+        help="Do not submit if jobs with UniqueId already found in queue",
+        dest="unique_id",
+    )
+    add_test_mode_arg(sync)
+
+    generate = subparsers.add_parser("generate")
+    generate.add_argument("src", type=Path)
+    add_test_mode_arg(generate)
+
+    subdag = subparsers.add_parser("write_subdag")
+    subdag.add_argument("source_prefix", type=Path)
+    subdag.add_argument("source_manifest", type=Path)
+    subdag.add_argument("dest_prefix", type=Path)
+    subdag.add_argument("dest_manifest", type=Path)
+    subdag.add_argument("transfer_manifest", type=Path)
+    subdag.add_argument("--requirements", help="Submit file requirements")
+    subdag.add_argument(
+        "--requirements_file",
+        help="File containing submit file requirements",
+        type=Path,
+    )
+    subdag.add_argument(
+        "--unique-id", help="Set UniqueId in submitted jobs", dest="unique_id"
+    )
+    add_test_mode_arg(subdag)
+
+    exec = subparsers.add_parser("exec")
+    exec.add_argument("src", type=Path)
+
+    verify_remote = subparsers.add_parser("verify_remote")
+    verify_remote.add_argument("src", type=Path)
+
+    verify = subparsers.add_parser("verify")
+    # SCRIPT POST xfer_{name} {xfer_py} verify {dest_prefix} {dest} {src_file_noslash}.metadata {transfer_manifest}
+    # verify.add_argument("dest_prefix")
+    # verify.add_argument("dest")
+    # verify.add_argument("metadata")
+    # verify.add_argument("metadata_summary")
+    verify.add_argument("--json", type=Path)
+    verify.add_argument("--fileid")
+
+    analyze = subparsers.add_parser("analyze")
+    analyze.add_argument("transfer_manifest", type=Path)
+
+    return parser.parse_args()
+
+
+def add_test_mode_arg(parser):
+    parser.add_argument(
+        "--test-mode",
+        help="Testing mode (only transfers small files)",
+        default=False,
+        action="store_true",
+        dest="test_mode",
+    )
 
 
 def main():
@@ -834,24 +867,23 @@ def main():
                             args.unique_id,
                         )
                         sys.exit()
-                working_dir = args.working_dir or os.getcwd()
                 print(
                     f"Will synchronize {args.src} at source to {args.dest} at destination"
                 )
-                cluster_id = submit_parent_dag(
-                    working_dir,
+                cluster_id = submit_outer_dag(
+                    args.working_dir,
                     args.src,
-                    os.path.abspath(args.dest),
+                    args.dest,
                     requirements=read_requirements_file(args.requirements_file)
                     or args.requirements,
-                    test_mode=args.test_mode,
                     unique_id=args.unique_id,
+                    test_mode=args.test_mode,
                 )
                 print(f"Parent job running in cluster {cluster_id}")
             elif args.cmd == "generate":
                 logging.info("Generating file listing for %s", args.src)
                 generate_file_listing(
-                    args.src, "source_manifest.txt", test_mode=args.test_mode
+                    args.src, Path("source_manifest.txt"), test_mode=args.test_mode
                 )
             elif args.cmd == "write_subdag":
                 logging.info(
@@ -859,12 +891,10 @@ def main():
                     args.source_prefix,
                     args.dest_prefix,
                 )
-                write_subdag(
+                write_inner_dag(
                     args.source_prefix,
                     args.source_manifest,
                     args.dest_prefix,
-                    args.dest_manifest,
-                    args.transfer_manifest,
                     requirements=read_requirements_file(args.requirements_file)
                     or args.requirements,
                     test_mode=args.test_mode,
@@ -873,15 +903,15 @@ def main():
             elif args.cmd == "exec":
                 xfer_exec(args.src)
             elif args.cmd == "verify":
-                with open(args.json, "r") as fp:
-                    cmd_info = json.load(fp)
+                with args.json.open(mode="r") as f:
+                    cmd_info = json.load(f)
                 # Split the DAG job name to get the cmd_info key
                 info = cmd_info[args.fileid.split(":")[-1]]
                 verify(
-                    info["dest_prefix"],
-                    info["dest"],
-                    f"{info['src_file_noslash']}.metadata",
-                    info["transfer_manifest"],
+                    Path(info["dest_prefix"]),
+                    Path(info["dest"]),
+                    Path(f"{info['src_file_noslash']}.metadata"),
+                    Path(info["transfer_manifest"]),
                 )
             elif args.cmd == "verify_remote":
                 verify_remote(args.src)
