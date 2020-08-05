@@ -407,9 +407,10 @@ def xfer_exec(src_path: Path):
         print("This executable must be run within the HTCondor runtime environment.")
         sys.exit(1)
 
-    dst_path = Path(os.environ["_CONDOR_SCRATCH_DIR"]) / SANDBOX_FILE_NAME
+    dest_path = Path(os.environ["_CONDOR_SCRATCH_DIR"]) / SANDBOX_FILE_NAME
+    tmp_path = dest_path.with_suffix(".tmp")
 
-    logging.info("About to copy %s to %s", src_path, dst_path)
+    logging.info("About to copy %s to %s", src_path, tmp_path)
 
     file_size = src_path.stat().st_size
     logging.info("There are %.2f MB to copy", file_size / MB)
@@ -417,7 +418,7 @@ def xfer_exec(src_path: Path):
 
     hash_obj = hashlib.sha1()
 
-    with src_path.open(mode="rb") as src, dst_path.open(mode="wb") as dst:
+    with src_path.open(mode="rb") as src, tmp_path.open(mode="wb") as dst:
         buf = src.read(MB)
         byte_count = len(buf)
 
@@ -445,15 +446,22 @@ def xfer_exec(src_path: Path):
 
         logging.info("File synchronized to disk")
 
-    logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
+    logging.info(f"Renaming {tmp_path} to {dest_path}")
 
-    with Path("metadata").open(mode="w") as metadata:
-        info = {
-            "name": str(src_path),
-            "digest": hash_obj.hexdigest(),
-            "size": byte_count,
-        }
-        metadata.write("{}\n".format(json.dumps(info)))
+    tmp_path.rename(dest_path)
+
+    logging.info(f"Renamed {tmp_path} to {dest_path}")
+
+    info = {
+        "name": str(src_path),
+        "digest": hash_obj.hexdigest(),
+        "size": byte_count,
+    }
+    logging.info(f"File metadata: {info}")
+
+    Path("metadata").write_text("{}\n".format(json.dumps(info)))
+
+    logging.info("Wrote metadata file")
 
 
 def verify_remote(src):
