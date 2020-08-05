@@ -841,84 +841,74 @@ def add_test_mode_arg(parser):
 
 
 def main():
-    # TODO: remove debug redirects
-    out = Path("/home/jtk/projects/htcondor_file_transfer") / "xfer.out"
-    with out.open(mode="a") as f, contextlib.redirect_stdout(
-        f
-    ), contextlib.redirect_stderr(f):
-        try:
-            logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
+    logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
 
-            args = parse_args()
+    args = parse_args()
 
-            print(f"Called with args: {args}")
+    print(f"Called with args: {args}")
 
-            if args.cmd == "sync":
-                if args.unique_id:
-                    schedd = htcondor.Schedd()
-                    existing_job = schedd.query(
-                        constraint=f"UniqueId == {classad.quote(args.unique_id)} && JobStatus =!= 4",
-                        attr_list=[],
-                        limit=1,
-                    )
-                    if len(existing_job) > 0:
-                        logging.warning(
-                            'Jobs already found in queue with UniqueId == "%s", exiting',
-                            args.unique_id,
-                        )
-                        sys.exit()
-                print(
-                    f"Will synchronize {args.src} at source to {args.dest} at destination"
+    if args.cmd == "sync":
+        if args.unique_id:
+            schedd = htcondor.Schedd()
+            existing_job = schedd.query(
+                constraint=f"UniqueId == {classad.quote(args.unique_id)} && JobStatus =!= 4",
+                attr_list=[],
+                limit=1,
+            )
+            if len(existing_job) > 0:
+                logging.warning(
+                    'Jobs already found in queue with UniqueId == "%s", exiting',
+                    args.unique_id,
                 )
-                cluster_id = submit_outer_dag(
-                    args.working_dir,
-                    args.src,
-                    args.dest,
-                    requirements=read_requirements_file(args.requirements_file)
-                    or args.requirements,
-                    unique_id=args.unique_id,
-                    test_mode=args.test_mode,
-                )
-                print(f"Parent job running in cluster {cluster_id}")
-            elif args.cmd == "generate":
-                logging.info("Generating file listing for %s", args.src)
-                generate_file_listing(
-                    args.src, Path("source_manifest.txt"), test_mode=args.test_mode
-                )
-            elif args.cmd == "write_subdag":
-                logging.info(
-                    "Generating SUBGDAG for transfer of %s->%s",
-                    args.source_prefix,
-                    args.dest_prefix,
-                )
-                write_inner_dag(
-                    args.source_prefix,
-                    args.source_manifest,
-                    args.dest_prefix,
-                    requirements=read_requirements_file(args.requirements_file)
-                    or args.requirements,
-                    test_mode=args.test_mode,
-                    unique_id=args.unique_id,
-                )
-            elif args.cmd == "exec":
-                xfer_exec(args.src)
-            elif args.cmd == "verify":
-                with args.json.open(mode="r") as f:
-                    cmd_info = json.load(f)
-                # Split the DAG job name to get the cmd_info key
-                info = cmd_info[args.fileid.split(":")[-1]]
-                verify(
-                    Path(info["dest_prefix"]),
-                    Path(info["dest"]),
-                    Path(f"{info['src_file_noslash']}.metadata"),
-                    Path(info["transfer_manifest"]),
-                )
-            elif args.cmd == "verify_remote":
-                verify_remote(args.src)
-            elif args.cmd == "analyze":
-                analyze(args.transfer_manifest)
-        except Exception:
-            logging.exception("woops")
+                sys.exit()
+        print(f"Will synchronize {args.src} at source to {args.dest} at destination")
+        cluster_id = submit_outer_dag(
+            args.working_dir,
+            args.src,
+            args.dest,
+            requirements=read_requirements_file(args.requirements_file)
+            or args.requirements,
+            unique_id=args.unique_id,
+            test_mode=args.test_mode,
+        )
+        print(f"Parent job running in cluster {cluster_id}")
+    elif args.cmd == "generate":
+        logging.info("Generating file listing for %s", args.src)
+        generate_file_listing(
+            args.src, Path("source_manifest.txt"), test_mode=args.test_mode
+        )
+    elif args.cmd == "write_subdag":
+        logging.info(
+            "Generating SUBGDAG for transfer of %s->%s",
+            args.source_prefix,
+            args.dest_prefix,
+        )
+        write_inner_dag(
+            args.source_prefix,
+            args.source_manifest,
+            args.dest_prefix,
+            requirements=read_requirements_file(args.requirements_file)
+            or args.requirements,
+            test_mode=args.test_mode,
+            unique_id=args.unique_id,
+        )
+    elif args.cmd == "exec":
+        xfer_exec(args.src)
+    elif args.cmd == "verify":
+        with args.json.open(mode="r") as f:
+            cmd_info = json.load(f)
+        # Split the DAG job name to get the cmd_info key
+        info = cmd_info[args.fileid.split(":")[-1]]
+        verify(
+            Path(info["dest_prefix"]),
+            Path(info["dest"]),
+            Path(f"{info['src_file_noslash']}.metadata"),
+            Path(info["transfer_manifest"]),
+        )
+    elif args.cmd == "verify_remote":
+        verify_remote(args.src)
+    elif args.cmd == "analyze":
+        analyze(args.transfer_manifest)
 
 
 if __name__ == "__main__":
