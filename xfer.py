@@ -65,7 +65,7 @@ def walk(path: Path) -> Iterator[os.DirEntry]:
 def shared_submit_descriptors(unique_id=None, requirements=None):
     return {
         "executable": THIS_FILE.as_posix(),
-        "My.IsTransferJob": "true",
+        "My.Is_Transfer_Job": "true",
         "My.WantFlocking": "true",
         "keep_claim_idle": "300",
         "request_disk": "1GB",
