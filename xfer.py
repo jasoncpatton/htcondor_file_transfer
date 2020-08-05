@@ -182,26 +182,19 @@ def parse_manifest(prefix: Path, manifest_path: Path, log_name):
             if not line or line.startswith("#"):
                 continue
 
-            if line.startswith("{"):
-                info = json.loads(line)
-                if "name" not in info:
-                    raise Exception(
-                        "Manifest line missing 'name' key.  Current line: %s" % line
-                    )
-                fname = info["name"]
-                if "size" not in info:
-                    raise Exception(
-                        "Manifest line missing 'size' key.  Current line: %s" % line
-                    )
-                size = int(info["size"])
-            else:
-                info = line.strip().split()
-                if len(info) != 2:
-                    raise Exception(
-                        "Manifest lines must have two columns.  Current line: %s" % line
-                    )
-                fname = info[0]
-                size = int(info[1])
+            info = json.loads(line)
+
+            if "name" not in info:
+                raise Exception(
+                    "Manifest line missing 'name' key.  Current line: %s" % line
+                )
+            fname = info["name"]
+            if "size" not in info:
+                raise Exception(
+                    "Manifest line missing 'size' key.  Current line: %s" % line
+                )
+            size = int(info["size"])
+
             if not fname.startswith(prefix):
                 logging.error(
                     "%s file (%s) does not start with specified prefix", log_name, fname
@@ -649,11 +642,8 @@ def analyze(transfer_manifest: Path):
                 continue
             sync_request["files"][fname] = size
             if info[0] == "TRANSFER_REQUEST":
-                if info[1][0] == "{":
-                    local_info = json.loads(" ".join(info[1:]))
-                    sync_request["xfer_files"].add(local_info["name"])
-                else:
-                    sync_request["xfer_files"].add(info[1])
+                local_info = json.loads(" ".join(info[1:]))
+                sync_request["xfer_files"].add(local_info["name"])
         # Format: TRANSFER_VERIFIED relative_fname hexdigest size timestamp:
         elif info[0] == "TRANSFER_VERIFIED":
             if sync_request_start is None:
