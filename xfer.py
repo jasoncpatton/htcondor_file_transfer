@@ -144,6 +144,18 @@ def walk(path):
             yield entry
 
 
+def shared_job_descriptors(unique_id, requirements):
+    return {
+        "executable": THIS_FILE.as_posix(),
+        "My.IsTransferJob": "true",
+        "requirements": requirements if requirements is not None else "true",
+        "My.UniqueID": f"{classad.quote(unique_id) if unique_id is not None else ''}",
+        "My.WantFlocking": "true",
+        "keep_claim_idle": "300",
+        "request_disk": "1GB",
+    }
+
+
 def submit_parent_dag(
     working_dir,
     source_dir,
@@ -163,19 +175,12 @@ def submit_parent_dag(
         name="calc_work",
         submit_description=htcondor.Submit(
             {
-                "universe": "vanilla",
-                "executable": THIS_FILE.as_posix(),
                 "output": "calc_work.out",
                 "error": "calc_work.err",
                 "log": "calc_work.log",
                 "arguments": f"generate {source_dir} {'--test-mode' if test_mode else ''}",
                 "should_transfer_files": "yes",
-                "requirements": requirements if requirements is not None else "True",
-                "My.IsTransferJob": "true",
-                "My.UniqueID": f"{classad.quote(unique_id) if unique_id is not None else ''}",
-                "My.WantFlocking": "true",
-                "keep_claim_idle": "300",
-                "request_disk": "1GB",
+                **shared_job_descriptors(unique_id, requirements),
             }
         ),
         post=dags.Script(
@@ -209,7 +214,7 @@ def submit_parent_dag(
         parent_dag, dag_dir=working_dir, dag_file_name="outer.dag"
     )
 
-    sub = htcondor.Submit.from_dag(str(outer_dag_file))
+    sub = htcondor.Submit.from_dag(str(outer_dag_file), {"force": 1})
 
     with change_dir(working_dir):
         schedd = htcondor.Schedd()
@@ -294,10 +299,7 @@ def write_subdag(
     transfer_manifest_path.parent.mkdir(parents=True, exist_ok=True)
     transfer_manifest_path.touch(exist_ok=True)
 
-    # TODO: WHAT DOES THIS DO?
-    # seems like it makes sure we don't re-verify files that have already been verified
-    # ... which means we never transfer files that have already been transferred by name
-    # even if they may have changed at the source!
+    # Check for files that we have already verified, and do not verify them again.
     files_verified = set()
     with transfer_manifest_path.open(mode="r") as f:
         for line in f:
@@ -311,17 +313,11 @@ def write_subdag(
             if info[0] != "TRANSFER_VERIFIED":
                 continue
 
-            if info[1] == "{":
-                info = json.loads(" ".join(info[1:]))
-                if "name" not in info or "digest" not in info or "size" not in info:
-                    continue
-            elif len(info) != 5:
+            info = json.loads(" ".join(info[1:]))
+            if not valid_metadata(info):
                 continue
-            else:
-                fname, hexdigest, size = info[1:-1]
 
-            relative_fname = fname
-            files_verified.add(relative_fname)
+            files_verified.add(info["name"])
 
     files_to_verify = set()
     for fname in src_files:
@@ -339,31 +335,28 @@ def write_subdag(
     cmd_info = []
     for idx, fname in enumerate(sorted(files_to_xfer)):
         src_file = os.path.join(source_prefix, fname)
-        src_file_noslash = fname.replace("/", "_SLASH_").replace(" ", "_SPACE_")
+        src_file_noslash = flatten_path(fname)
         dest = os.path.join(dest_prefix, fname)
         dest_dirs.add(os.path.split(dest)[0])
 
         logging.info("File transfer to perform: %s->%s", src_file, dest)
 
-        cmd_info.append(
-            {
-                "src_file": src_file,
-                "src_file_noslash": src_file_noslash,
-                "dest": dest,
-                "transfer_manifest": str(transfer_manifest_path),
-                "dest_prefix": dest_prefix,
-            }
-        )
+        info = {
+            "src_file": src_file,
+            "src_file_noslash": src_file_noslash,
+            "dest": dest,
+            "transfer_manifest": str(transfer_manifest_path),
+            "dest_prefix": dest_prefix,
+        }
+        cmd_info.append(info)
 
     with open("xfer_commands.json", "w") as cmd_fp:
-        json.dump(dict(enumerate(cmd_info)), cmd_fp)
+        json.dump(dict(enumerate(map(values_to_strings, cmd_info))), cmd_fp)
 
     inner_dag.layer(
         name="xfer",
         submit_description=htcondor.Submit(
             {
-                "universe": "vanilla",
-                "executable": THIS_FILE.as_posix(),
                 "output": "$(src_file_noslash).out",
                 "error": "$(src_file_noslash).err",
                 "log": "xfer_file.log",
@@ -373,12 +366,7 @@ def write_subdag(
                 "transfer_output_remaps": classad.quote(
                     f"{SANDBOX_FILE_NAME} = $(dest); metadata = $(src_file_noslash).metadata"
                 ),
-                "requirements": requirements if requirements is not None else "True",
-                "My.IsTransferJob": "true",
-                "My.UniqueID": f"{classad.quote(unique_id) if unique_id is not None else ''}",
-                "My.WantFlocking": "true",
-                "keep_claim_idle": "300",
-                "request_disk": "1GB",
+                **shared_job_descriptors(unique_id, requirements),
             }
         ),
         vars=cmd_info,
@@ -391,30 +379,27 @@ def write_subdag(
     cmd_info = []
     for fname in files_to_verify:
         src_file = os.path.join(source_prefix, fname)
-        src_file_noslash = fname.replace("/", "_SLASH_").replace(" ", "_SPACE_")
+        src_file_noslash = flatten_path(fname)
         dest = os.path.join(dest_prefix, fname)
 
         logging.info("File to verify: %s", src_file)
 
-        cmd_info.append(
-            {
-                "src_file": src_file,
-                "src_file_noslash": src_file_noslash,
-                "dest": dest,
-                "transfer_manifest": transfer_manifest_path,
-                "dest_prefix": dest_prefix,
-            }
-        )
+        info = {
+            "src_file": src_file,
+            "src_file_noslash": src_file_noslash,
+            "dest": dest,
+            "transfer_manifest": transfer_manifest_path,
+            "dest_prefix": dest_prefix,
+        }
+        cmd_info.append(info)
 
     with open("verify_commands.json", "w") as cmd_fp:
-        json.dump(dict(enumerate(cmd_info)), cmd_fp)
+        json.dump(dict(enumerate(map(values_to_strings, cmd_info))), cmd_fp)
 
     inner_dag.layer(
         name="verify",
         submit_description=htcondor.Submit(
             {
-                "universe": "vanilla",
-                "executable": THIS_FILE.as_posix(),
                 "output": "$(src_file_noslash).out",
                 "error": "$(src_file_noslash).err",
                 "log": "verify_file.log",
@@ -424,12 +409,7 @@ def write_subdag(
                 "transfer_output_remaps": classad.quote(
                     "metadata = $(src_file_noslash).metadata"
                 ),
-                "requirements": requirements if requirements is not None else "True",
-                "My.IsTransferJob": "true",
-                "My.UniqueID": f"{classad.quote(unique_id) if unique_id is not None else ''}",
-                "My.WantFlocking": "true",
-                "keep_claim_idle": "300",
-                "request_disk": "1GB",
+                **shared_job_descriptors(unique_id, requirements),
             }
         ),
         vars=cmd_info,
@@ -438,6 +418,8 @@ def write_subdag(
             arguments=["verify", "--json=verify_commands.json", "--fileid", "$JOB"],
         ),
     )
+
+    print(inner_dag.describe())
 
     dags.write_dag(inner_dag, dag_dir=Path.cwd(), dag_file_name="inner.dag")
 
@@ -457,6 +439,14 @@ def write_subdag(
         for fname in files_to_verify:
             info = {"name": fname, "size": src_files[fname]}
             f.write("VERIFY_REQUEST {}\n".format(json.dumps(info)))
+
+
+def flatten_path(path):
+    return str(path).replace("/", "_SLASH_").replace(" ", "_SPACE_")
+
+
+def values_to_strings(mapping):
+    return {k: str(v) for k, v in mapping.items()}
 
 
 def xfer_exec(src_path):
@@ -554,8 +544,12 @@ def verify_remote(src):
     logging.info("File metadata: hash=%s, size=%d", hash_obj.hexdigest(), byte_count)
 
     with open("metadata", "w") as metadata_fd:
-        info = {"name": src, "digest": hash_obj.hexdigest(), "size": byte_count}
+        info = {"name": str(src), "digest": hash_obj.hexdigest(), "size": byte_count}
         metadata_fd.write(f"{json.dumps(info)}\n")
+
+
+def valid_metadata(metadata):
+    return all(key in metadata for key in {"name", "digest", "size"})
 
 
 def verify(dest_prefix, dest, metadata_path, metadata_summary):
@@ -576,7 +570,7 @@ def verify(dest_prefix, dest, metadata_path, metadata_summary):
 
     info = json.loads(contents)
 
-    if any(key not in info for key in {"name", "digest", "size"}):
+    if not valid_metadata(info):
         logging.error("Metadata file format incorrect; missing keys")
         sys.exit(1)
 
@@ -814,6 +808,7 @@ def analyze(transfer_manifest):
 
 
 def main():
+    # TODO: remove debug redirects
     out = Path("/home/jtk/projects/htcondor_file_transfer") / "xfer.out"
     with out.open(mode="a") as f, contextlib.redirect_stdout(
         f
