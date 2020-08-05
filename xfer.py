@@ -358,11 +358,14 @@ def write_subdag(source_prefix, source_manifest, dest_prefix, dest_manifest, tra
             info = line.strip().split()
             if info[0] != 'TRANSFER_VERIFIED':
                 continue
-            if info[1] == '{':
+            if info[1][0] == '{':
                 info = json.loads(" ".join(info[1:]))
                 if 'name' not in info or 'digest' not in info or \
                         'size' not in info:
                     continue
+                fname = info['name']
+                hexdigest = info['digest']
+                size = info['size']
             elif len(info) != 5:
                 continue
             else:
