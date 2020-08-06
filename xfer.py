@@ -70,7 +70,9 @@ def shared_submit_descriptors(unique_id=None, requirements=None):
         "request_disk": "1GB",
         "on_exit_hold": "ExitCode =!= 0",
         "requirements": requirements if requirements is not None else "true",
-        "My.UniqueID": "{}".format(classad.quote(unique_id) if unique_id is not None else ''),
+        "My.UniqueID": "{}".format(
+            classad.quote(unique_id) if unique_id is not None else ""
+        ),
     }
 
 
@@ -141,7 +143,9 @@ def make_outer_dag(
                 "output": "calc_work.out",
                 "error": "calc_work.err",
                 "log": "calc_work.log",
-                "arguments": "generate {} {}".format(source_dir, '--test-mode' if test_mode else ''),
+                "arguments": "generate {} {}".format(
+                    source_dir, "--test-mode" if test_mode else ""
+                ),
                 "should_transfer_files": "yes",
                 **shared_submit_descriptors(unique_id, requirements),
             }
@@ -298,7 +302,15 @@ def write_inner_dag(
     bytes_to_verify = sum(src_files[fname] for fname in files_to_verify)
     with transfer_manifest_path.open(mode="a") as f:
         f.write(
-            "SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}\n".format(source_prefix, len(src_files), len(files_to_xfer), bytes_to_transfer, len(files_to_verify), bytes_to_verify, time.time())
+            "SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}\n".format(
+                source_prefix,
+                len(src_files),
+                len(files_to_xfer),
+                bytes_to_transfer,
+                len(files_to_verify),
+                bytes_to_verify,
+                time.time(),
+            )
         )
 
         for fname in files_to_xfer:
@@ -381,7 +393,9 @@ def make_inner_dag(
                 "should_transfer_files": "yes",
                 "transfer_output_files": "{}, metadata".format(SANDBOX_FILE_NAME),
                 "transfer_output_remaps": classad.quote(
-                    "{} = $(dest); metadata = $(src_file_noslash).metadata".format(SANDBOX_FILE_NAME)
+                    "{} = $(dest); metadata = $(src_file_noslash).metadata".format(
+                        SANDBOX_FILE_NAME
+                    )
                 ),
                 **shared_submit_descriptors(unique_id, requirements),
             }
@@ -866,7 +880,9 @@ def main():
         if args.unique_id:
             schedd = htcondor.Schedd()
             existing_job = schedd.query(
-                constraint="UniqueId == {} && JobStatus =!= 4".format(classad.quote(args.unique_id)),
+                constraint="UniqueId == {} && JobStatus =!= 4".format(
+                    classad.quote(args.unique_id)
+                ),
                 attr_list=[],
                 limit=1,
             )
@@ -876,7 +892,11 @@ def main():
                     args.unique_id,
                 )
                 sys.exit()
-        print("Will synchronize {} at source to {} at destination".format(args.src, args.dest))
+        print(
+            "Will synchronize {} at source to {} at destination".format(
+                args.src, args.dest
+            )
+        )
         cluster_id = submit_outer_dag(
             args.working_dir,
             args.src,
@@ -917,7 +937,7 @@ def main():
         verify(
             Path(info["dest_prefix"]),
             Path(info["dest"]),
-            Path("{}.metadata".format(info['src_file_noslash'])),
+            Path("{}.metadata".format(info["src_file_noslash"])),
             Path(info["transfer_manifest"]),
         )
     elif args.cmd == "verify_remote":
