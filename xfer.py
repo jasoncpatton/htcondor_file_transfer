@@ -611,7 +611,7 @@ def verify(dest_prefix: Path, dest: Path, metadata_path: Path, metadata_summary:
             "size": src_size,
             "timestamp": int(time.time()),
         }
-        md_fd.write("TRANSFER_VERIFIED {}\n".format(json.dumps(info)})
+        md_fd.write("TRANSFER_VERIFIED {}\n".format(json.dumps(info)))
         os.fsync(md_fd.fileno())
 
     metadata_path.unlink()
