@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Iterator, Optional, Mapping, TypeVar, Dict, List
 
 import htcondor
-import htcondor.dags as dags
 import classad
 
 
@@ -83,9 +82,15 @@ def submit_outer_dag(
     unique_id: Optional[str] = None,
     test_mode: bool = False,
 ):
+
+    # Only import htcondor.dags submit-side
+    import htcondor.dags as dags
+
     working_dir = working_dir.resolve()
     dest_dir = dest_dir.resolve()
-    source_dir = source_dir.resolve()
+
+    working_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
     transfer_manifest_path = dest_dir / "transfer_manifest.txt"
 
@@ -123,6 +128,10 @@ def make_outer_dag(
     unique_id,
     working_dir,
 ):
+
+    # Only import htcondor.dags submit-side
+    import htcondor.dags as dags
+
     outer_dag = dags.DAG()
 
     outer_dag.layer(
@@ -217,6 +226,10 @@ def write_inner_dag(
     test_mode: bool = False,
     unique_id=None,
 ):
+
+    # Only import htcondor.dags submit-side
+    import htcondor.dags as dags
+
     src_files = parse_manifest(source_prefix, source_manifest, "Source")
 
     generate_file_listing(dest_prefix, Path("destination_manifest.txt"))
@@ -348,7 +361,11 @@ def make_inner_dag(
     verify_cmd_info: T_CMD_INFO,
     unique_id: Optional[str] = None,
     test_mode: bool = False,
-) -> dags.DAG:
+):
+
+    # Only import htcondor.dags submit-side
+    import htcondor.dags as dags
+
     inner_dag = dags.DAG(
         max_jobs_by_category={"TRANSFER_JOBS": 1} if test_mode else None
     )
