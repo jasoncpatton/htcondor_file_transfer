@@ -53,8 +53,8 @@ def generate_file_listing(src: Path, manifest_path: Path, test_mode: bool = Fals
             f.write("{}\n".format(json.dumps(info)))
 
 
-def walk(path: Path) -> Iterator[os.DirEntry]:
-    for entry in os.scandir(path):
+def walk(path: Path):
+    for entry in os.scandir(str(path)):
         if entry.is_dir():
             yield from walk(entry.path)
         elif entry.is_file():
@@ -68,7 +68,6 @@ def shared_submit_descriptors(unique_id=None, requirements=None):
         "My.WantFlocking": "true",
         "keep_claim_idle": "300",
         "request_disk": "1GB",
-        "on_exit_hold": "ExitCode =!= 0",
         "requirements": requirements if requirements is not None else "true",
         "My.UniqueID": "{}".format(classad.quote(unique_id) if unique_id is not None else ''),
     }
@@ -111,7 +110,8 @@ def submit_outer_dag(
         outer_dag, dag_dir=working_dir, dag_file_name="outer.dag"
     )
 
-    sub = htcondor.Submit.from_dag(str(outer_dag_file))
+    dag_args = {'force': 1}
+    sub = htcondor.Submit.from_dag(str(outer_dag_file), dag_args)
 
     with change_dir(working_dir):
         schedd = htcondor.Schedd()
