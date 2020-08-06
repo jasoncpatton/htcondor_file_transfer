@@ -50,7 +50,7 @@ def generate_file_listing(src: Path, manifest_path: Path, test_mode: bool = Fals
                 continue
 
             info = {"name": entry.path, "size": size}
-            f.write(f"{json.dumps(info)}\n")
+            f.write("{}\n".format(json.dumps(info)))
 
 
 def walk(path: Path) -> Iterator[os.DirEntry]:
@@ -70,7 +70,7 @@ def shared_submit_descriptors(unique_id=None, requirements=None):
         "request_disk": "1GB",
         "on_exit_hold": "ExitCode =!= 0",
         "requirements": requirements if requirements is not None else "true",
-        "My.UniqueID": f"{classad.quote(unique_id) if unique_id is not None else ''}",
+        "My.UniqueID": "{}".format(classad.quote(unique_id) if unique_id is not None else ''),
     }
 
 
@@ -141,7 +141,7 @@ def make_outer_dag(
                 "output": "calc_work.out",
                 "error": "calc_work.err",
                 "log": "calc_work.log",
-                "arguments": f"generate {source_dir} {'--test-mode' if test_mode else ''}",
+                "arguments": "generate {} {}".format(source_dir, '--test-mode' if test_mode else ''),
                 "should_transfer_files": "yes",
                 **shared_submit_descriptors(unique_id, requirements),
             }
@@ -298,7 +298,7 @@ def write_inner_dag(
     bytes_to_verify = sum(src_files[fname] for fname in files_to_verify)
     with transfer_manifest_path.open(mode="a") as f:
         f.write(
-            f"SYNC_REQUEST {source_prefix} files_at_source={len(src_files)} files_to_transfer={len(files_to_xfer)} bytes_to_transfer={bytes_to_transfer} files_to_verify={len(files_to_verify)} bytes_to_verify={bytes_to_verify} timestamp={time.time()}\n"
+            "SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}\n".format(source_prefix, len(src_files), len(files_to_xfer), bytes_to_transfer, len(files_to_verify), bytes_to_verify, time.time())
         )
 
         for fname in files_to_xfer:
@@ -379,9 +379,9 @@ def make_inner_dag(
                 "log": "xfer_file.log",
                 "arguments": classad.quote("exec '$(src_file)'"),
                 "should_transfer_files": "yes",
-                "transfer_output_files": f"{SANDBOX_FILE_NAME}, metadata",
+                "transfer_output_files": "{}, metadata".format(SANDBOX_FILE_NAME),
                 "transfer_output_remaps": classad.quote(
-                    f"{SANDBOX_FILE_NAME} = $(dest); metadata = $(src_file_noslash).metadata"
+                    "{} = $(dest); metadata = $(src_file_noslash).metadata".format(SANDBOX_FILE_NAME)
                 ),
                 **shared_submit_descriptors(unique_id, requirements),
             }
@@ -400,7 +400,7 @@ def make_inner_dag(
                 "output": "$(src_file_noslash).out",
                 "error": "$(src_file_noslash).err",
                 "log": "verify_file.log",
-                "arguments": classad.quote(f"verify_remote '$(src_file)'"),
+                "arguments": classad.quote("verify_remote '$(src_file)'"),
                 "should_transfer_files": "yes",
                 "transfer_output_files": "metadata",
                 "transfer_output_remaps": classad.quote(
@@ -463,18 +463,18 @@ def xfer_exec(src_path: Path):
 
         logging.info("File synchronized to disk")
 
-    logging.info(f"Renaming {tmp_path} to {dest_path}")
+    logging.info("Renaming {} to {}".format(tmp_path, dest_path))
 
     tmp_path.rename(dest_path)
 
-    logging.info(f"Renamed {tmp_path} to {dest_path}")
+    logging.info("Renamed {} to {}".format(tmp_path, dest_path))
 
     info = {
         "name": str(src_path),
         "digest": hash_obj.hexdigest(),
         "size": byte_count,
     }
-    logging.info(f"File metadata: {info}")
+    logging.info("File metadata: {}".format(info))
 
     Path("metadata").write_text("{}\n".format(json.dumps(info)))
 
@@ -521,7 +521,7 @@ def verify_remote(src):
 
     with Path("metadata").open(mode="w") as metadata:
         info = {"name": str(src), "digest": hash_obj.hexdigest(), "size": byte_count}
-        metadata.write(f"{json.dumps(info)}\n")
+        metadata.write("{}\n".format(json.dumps(info)))
 
 
 def verify(dest_prefix: Path, dest: Path, metadata_path: Path, metadata_summary: Path):
@@ -611,7 +611,7 @@ def verify(dest_prefix: Path, dest: Path, metadata_path: Path, metadata_summary:
             "size": src_size,
             "timestamp": int(time.time()),
         }
-        md_fd.write(f"TRANSFER_VERIFIED {json.dumps(info)}\n")
+        md_fd.write("TRANSFER_VERIFIED {}\n".format(json.dumps(info)})
         os.fsync(md_fd.fileno())
 
     metadata_path.unlink()
@@ -763,7 +763,7 @@ def analyze(transfer_manifest: Path):
 
     if sync_request_start is not None:
         with transfer_manifest.open(mode="a") as f:
-            f.write(f"SYNC_DONE {int(time.time())}\n")
+            f.write("SYNC_DONE {}\n".format(int(time.time())))
         print("Synchronization done; verification complete.")
     elif sync_count:
         print("All synchronizations done; verification complete")
@@ -860,13 +860,13 @@ def main():
 
     args = parse_args()
 
-    print(f"Called with args: {args}")
+    print("Called with args: {}".format(args))
 
     if args.cmd == "sync":
         if args.unique_id:
             schedd = htcondor.Schedd()
             existing_job = schedd.query(
-                constraint=f"UniqueId == {classad.quote(args.unique_id)} && JobStatus =!= 4",
+                constraint="UniqueId == {} && JobStatus =!= 4".format(classad.quote(args.unique_id)),
                 attr_list=[],
                 limit=1,
             )
@@ -876,7 +876,7 @@ def main():
                     args.unique_id,
                 )
                 sys.exit()
-        print(f"Will synchronize {args.src} at source to {args.dest} at destination")
+        print("Will synchronize {} at source to {} at destination".format(args.src, args.dest))
         cluster_id = submit_outer_dag(
             args.working_dir,
             args.src,
@@ -886,7 +886,7 @@ def main():
             unique_id=args.unique_id,
             test_mode=args.test_mode,
         )
-        print(f"Parent job running in cluster {cluster_id}")
+        print("Parent job running in cluster {}".format(cluster_id))
     elif args.cmd == "generate":
         logging.info("Generating file listing for %s", args.src)
         generate_file_listing(
@@ -917,7 +917,7 @@ def main():
         verify(
             Path(info["dest_prefix"]),
             Path(info["dest"]),
-            Path(f"{info['src_file_noslash']}.metadata"),
+            Path("{}.metadata".format(info['src_file_noslash'])),
             Path(info["transfer_manifest"]),
         )
     elif args.cmd == "verify_remote":
