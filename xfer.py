@@ -5,6 +5,7 @@ Utilize HTCondor to transfer / synchronize a directory from a source on an
 execute host to a local destination on the submit host.
 """
 
+import abc
 import argparse
 import contextlib
 import enum
@@ -25,8 +26,8 @@ from typing import (
     Any,
     Tuple,
     Iterator,
-    Set,
     Iterable,
+    cast,
 )
 
 import htcondor
@@ -54,7 +55,7 @@ class TransferError(Exception):
     pass
 
 
-class InvalidMetadata(TransferError, ValueError):
+class InvalidManifestEntry(TransferError, ValueError):
     pass
 
 
@@ -96,34 +97,154 @@ class ManifestEntryType(str, enum.Enum):
     SYNC_REQUEST = "SYNC_REQUEST"
     SYNC_DONE = "SYNC_DONE"
     FILE = "FILE"
+    METADATA = "METADATA"
 
 
-def format_manifest_entry(type: ManifestEntryType, info: T_JSON) -> str:
-    return "{} {}\n".format(type, json.dumps(path_values_to_strings(info)))
+class ManifestEntry(metaclass=abc.ABCMeta):
+    def __init__(self, **info):
+        expected_keys = set(self.keys)
+
+        if info.keys() < expected_keys:
+            raise InvalidManifestEntry(
+                "Info {} for {} is missing keys: {}".format(
+                    info, type(self).__name__, expected_keys - info.keys()
+                )
+            )
+        if info.keys() > expected_keys:
+            logging.warning(
+                "Info {} for {} has extra keys: {}".format(
+                    info, type(self).__name__, info.keys() - expected_keys
+                )
+            )
+
+        self._info = {k: info[k] for k in self.keys}
+
+    def __str__(self):
+        return "{} {}".format(self.type, json.dumps(self.to_json()))
+
+    def to_json(self) -> T_JSON:
+        return path_values_to_strings(self._info)
+
+    def to_entry(self):
+        return "{}\n".format(self)
+
+    def write_entry_to(self, file):
+        file.write(self.to_entry())
+
+    @abc.abstractmethod
+    @property
+    def keys(self) -> Tuple[str, ...]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    @property
+    def type(self) -> ManifestEntryType:
+        raise NotImplementedError
 
 
-def read_manifest(path: Path) -> Iterator[Tuple[Tuple[ManifestEntryType, T_JSON], int]]:
+class NameAndSize(ManifestEntry):
+    @property
+    def name(self):
+        return Path(self._info["name"])
+
+    @property
+    def size(self):
+        return int(self._info["size"])
+
+
+class Digest(NameAndSize):
+    @property
+    def digest(self):
+        return self._info["digest"]
+
+
+class Timestamp(ManifestEntry):
+    @property
+    def timestamp(self):
+        return float(self._info["timestamp"])
+
+
+class TransferRequest(NameAndSize):
+    type = ManifestEntryType.TRANSFER_REQUEST
+    keys = ("name", "size")
+
+
+class VerifyRequest(NameAndSize):
+    type = ManifestEntryType.VERIFY_REQUEST
+    keys = ("name", "size")
+
+
+class TransferVerified(Digest, Timestamp):
+    type = ManifestEntryType.TRANSFER_VERIFIED
+    keys = ("name", "size", "digest", "timestamp")
+
+
+class SyncRequest(ManifestEntry):
+    type = ManifestEntryType.SYNC_REQUEST
+    keys = (
+        "source_prefix",
+        "files_at_source",
+        "files_to_transfer",
+        "bytes_to_transfer",
+        "files_to_verify",
+        "bytes_to_verify",
+        "timestamp",
+    )
+
+
+class SyncDone(Timestamp):
+    type = ManifestEntryType.SYNC_DONE
+    keys = ("timestamp",)
+
+
+class File(NameAndSize):
+    type = ManifestEntryType.FILE
+    keys = ("name", "size")
+
+
+class Metadata(Digest):
+    type = ManifestEntryType.METADATA
+    keys = ("name", "size", "digest")
+
+
+def descendants(cls):
+    for c in cls.__subclasses__():
+        yield c
+        yield from descendants(c)
+
+
+ENTRY_TYPE_TO_CLASS = {cls.type: cls for cls in descendants(ManifestEntry)}
+
+
+def read_manifest(path: Path) -> Iterator[Tuple[ManifestEntry, int]]:
     with path.open(mode="r") as f:
-        for line, entry in enumerate(f, start=1):
-            entry = entry.strip()
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
 
-            if not entry or entry.startswith("#"):
+            if not line or line.startswith("#"):
                 continue
 
-            yield parse_manifest_entry(entry), line
+            try:
+                yield parse_manifest_entry(line), line_number
+            except Exception:
+                logging.exception(
+                    'Failed to parse manifest entry at {}:{} ("{}")'.format(
+                        path, line_number, line
+                    )
+                )
+                raise
 
 
-def parse_manifest_entry(entry: str,) -> Tuple[ManifestEntryType, T_JSON]:
+def parse_manifest_entry(entry: str) -> ManifestEntry:
     entry = entry.strip()
     type, info = entry.split(maxsplit=1)
 
     type = ManifestEntryType(type)
     info = json.loads(info)
 
-    if "size" in info:
-        info["size"] = int(info["size"])
+    cls = ENTRY_TYPE_TO_CLASS[type]
 
-    return type, info
+    return cls(**info)
 
 
 def create_file_manifest(
@@ -136,36 +257,32 @@ def create_file_manifest(
             if test_mode and size > 50 * MB:
                 continue
 
-            info = {"name": entry.path, "size": size}
-            f.write(format_manifest_entry(ManifestEntryType.FILE, info))
+            File(name=entry.path, size=size).write_entry_to(f)
 
     return manifest_path
 
 
 def parse_file_manifest(
     prefix: Path, file_manifest_path: Path, log_name: str
-) -> Dict[str, int]:
-    prefix = str(prefix.resolve())
+) -> Dict[Path, int]:
     files = {}
-    for (type, info), _ in read_manifest(file_manifest_path):
-        if "name" not in info:
-            raise Exception("File manifest entry missing 'name' key.  Info: %s" % info)
-        fname = info["name"]
-        if "size" not in info:
-            raise Exception("File manifest entry missing 'size' key.  Info: %s" % info)
-        size = info["size"]
+    for entry, _ in read_manifest(file_manifest_path):
+        entry = check_entry_type(entry, File)
 
-        if not fname.startswith(prefix):
+        fname = entry.name
+        size = entry.size
+
+        if prefix not in fname.parents:
             logging.error(
                 "%s file (%s) does not start with specified prefix", log_name, fname
             )
-        fname = fname[len(prefix) + 1 :]
-        if not fname:
+        if fname == prefix:
             logging.warning(
                 "%s file, stripped of prefix (%s), is empty", log_name, prefix
             )
             continue
-        files[fname] = size
+        files[fname.relative_to(prefix)] = size
+
     return files
 
 
@@ -175,6 +292,47 @@ def walk(path):
             yield from walk(entry.path)
         elif entry.is_file():
             yield entry
+
+
+def write_metadata_file(src_path: Path, hash, size: int) -> None:
+    metadata = Metadata(name=src_path, digest=hash.hexdigest(), size=size)
+
+    logging.info("File metadata: {}".format(metadata))
+
+    with Path(METADATA_FILE_NAME).open(mode="w") as f:
+        metadata.write_entry_to(f)
+
+    logging.info("Wrote metadata file")
+
+
+def read_metadata_file(path: Path) -> Metadata:
+    if path.stat().st_size > METADATA_FILE_SIZE_LIMIT:
+        raise InvalidManifestEntry("Metadata file is too large")
+
+    entry, _ = tuple(read_manifest(path))[0]
+
+    return check_entry_type(entry, Metadata)
+
+
+def check_entry_type(entry, expected_type):
+    if not isinstance(entry, expected_type):
+        raise InvalidManifestEntry(
+            "Expected a {}, but got a {}".format(
+                expected_type.__name__, type(entry).__name__
+            )
+        )
+
+    return cast(expected_type, entry)
+
+
+def write_json(j: T_JSON, path: Path) -> None:
+    with path.open(mode="w") as f:
+        json.dump(j, f)
+
+
+def load_json(path: Path) -> T_JSON:
+    with path.open(mode="r") as f:
+        return json.load(f)
 
 
 def shared_submit_descriptors(unique_id=None, requirements=None):
@@ -198,7 +356,7 @@ def submit_outer_dag(
     requirements: Optional[str] = None,
     unique_id: Optional[str] = None,
     test_mode: bool = False,
-):
+) -> int:
     # Only import htcondor.dags submit-side
     import htcondor.dags as dags
 
@@ -304,9 +462,10 @@ def write_inner_dag(
 
     src_files = parse_file_manifest(source_prefix, source_manifest, "Source")
 
-    create_file_manifest(dest_prefix, Path("destination_manifest.txt"))
+    destination_manifest_path = Path("destination_manifest.txt")
+    create_file_manifest(dest_prefix, destination_manifest_path)
     dest_files = parse_file_manifest(
-        dest_prefix, Path("destination_manifest.txt"), "Destination"
+        dest_prefix, destination_manifest_path, "Destination"
     )
 
     files_to_xfer = set()
@@ -320,14 +479,11 @@ def write_inner_dag(
 
     # Check for files that we have already verified, and do not verify them again.
     files_verified = set()
-    for (type, info), _ in read_manifest(transfer_manifest_path):
-        if type is not ManifestEntryType.TRANSFER_VERIFIED:
+    for entry, _ in read_manifest(transfer_manifest_path):
+        if not isinstance(entry, TransferVerified):
             continue
 
-        if not metadata_keys_present(info):
-            continue
-
-        files_verified.add(info["name"])
+        files_verified.add(entry.name)
 
     files_to_verify = set()
     for fname in src_files:
@@ -342,6 +498,8 @@ def write_inner_dag(
 
     ensure_destination_dirs_exist(dest_prefix, files_to_xfer)
 
+    print(source_prefix)
+    print(dest_prefix)
     xfer_cmd_info = make_cmd_info(
         files_to_xfer, source_prefix, dest_prefix, transfer_manifest_path
     )
@@ -362,28 +520,23 @@ def write_inner_dag(
 
     bytes_to_transfer = sum(src_files[fname] for fname in files_to_xfer)
     bytes_to_verify = sum(src_files[fname] for fname in files_to_verify)
+
     with transfer_manifest_path.open(mode="a") as f:
-        f.write(
-            format_manifest_entry(
-                ManifestEntryType.SYNC_REQUEST,
-                {
-                    "source_prefix": source_prefix,
-                    "files_at_source": len(src_files),
-                    "files_to_transfer": len(files_to_xfer),
-                    "bytes_to_transfer": bytes_to_transfer,
-                    "files_to_verify": len(files_to_verify),
-                    "bytes_to_verify": bytes_to_verify,
-                    "timestamp": timestamp(),
-                },
-            )
-        )
+        SyncRequest(
+            source_prefix=source_prefix,
+            files_at_source=len(src_files),
+            files_to_transfer=len(files_to_xfer),
+            bytes_to_transfer=bytes_to_transfer,
+            files_to_verify=len(files_to_verify),
+            bytes_to_verify=bytes_to_verify,
+            timestamp=timestamp(),
+        ).write_entry_to(f)
 
         for fname in files_to_xfer:
-            info = {"name": fname, "size": src_files[fname]}
-            f.write(format_manifest_entry(ManifestEntryType.TRANSFER_REQUEST, info))
+            TransferRequest(name=fname, size=src_files[fname]).write_entry_to(f)
+
         for fname in files_to_verify:
-            info = {"name": fname, "size": src_files[fname]}
-            f.write(format_manifest_entry(ManifestEntryType.VERIFY_REQUEST, info))
+            VerifyRequest(name=fname, size=src_files[fname]).write_entry_to(f)
 
 
 def make_inner_dag(
@@ -459,7 +612,7 @@ def change_dir(dir):
     os.chdir(original)
 
 
-def ensure_destination_dirs_exist(prefix: Path, files_to_xfer: Iterable[str]):
+def ensure_destination_dirs_exist(prefix: Path, files_to_xfer: Iterable[Path]):
     dest_dirs = {(prefix / relative_path).parent for relative_path in files_to_xfer}
     for dest_dir in dest_dirs:
         dest_dir.mkdir(exist_ok=True, parents=True)
@@ -477,8 +630,8 @@ def make_cmd_info(files, source_prefix, dest_prefix, transfer_manifest_path):
             "src_file": src_file,
             "src_file_noslash": src_file_noslash,
             "dest": dest,
-            "transfer_manifest": transfer_manifest_path,
             "dest_prefix": dest_prefix,
+            "transfer_manifest": transfer_manifest_path,
         }
         cmd_info.append(info)
 
@@ -486,8 +639,7 @@ def make_cmd_info(files, source_prefix, dest_prefix, transfer_manifest_path):
 
 
 def write_cmd_info(cmd_info: T_CMD_INFO, path: Path) -> None:
-    with path.open("w") as cmd_fp:
-        json.dump(dict(enumerate(map(path_values_to_strings, cmd_info))), cmd_fp)
+    write_json(dict(enumerate(map(path_values_to_strings, cmd_info))), path)
 
 
 def flatten_path(path: Path) -> str:
@@ -524,13 +676,13 @@ def check_running_as_job():
 def verify(
     dest_prefix: Path, dest: Path, metadata_path: Path, transfer_manifest_path: Path
 ) -> None:
-    info = read_metadata_file(metadata_path)
+    entry = read_metadata_file(metadata_path)
 
-    src_fname = info["name"]
-    src_hexdigest = info["digest"]
-    src_size = info["size"]
+    src_fname = entry.name
+    src_hexdigest = entry.digest
+    src_size = entry.size
 
-    relative_fname = dest.relative_to(dest_prefix)
+    print(dest, dest_prefix)
 
     logging.info("About to verify contents of %s", dest)
 
@@ -561,13 +713,12 @@ def verify(
     )
 
     with transfer_manifest_path.open(mode="a") as f:
-        info = {
-            "name": str(relative_fname),
-            "digest": src_hexdigest,
-            "size": src_size,
-            "timestamp": timestamp(),
-        }
-        f.write(format_manifest_entry(ManifestEntryType.TRANSFER_VERIFIED, info))
+        TransferVerified(
+            name=dest.relative_to(dest_prefix),
+            digest=src_hexdigest,
+            size=src_size,
+            timestamp=timestamp(),
+        ).write_entry_to(f)
 
         os.fsync(f.fileno())
 
@@ -581,7 +732,7 @@ def verify(
             err_file.unlink()
 
 
-def copy_with_hash(src_path: Path, dest_path: Path):
+def copy_with_hash(src_path: Path, dest_path: Path) -> Tuple[Any, int]:
     tmp_path = dest_path.with_suffix(".tmp")
     logging.info("About to copy %s to %s", src_path, tmp_path)
 
@@ -635,7 +786,7 @@ def copy_with_hash(src_path: Path, dest_path: Path):
     return hash, byte_count
 
 
-def hash_file(path: Path):
+def hash_file(path: Path) -> Tuple[Any, int]:
     logging.info("About to hash %s", path)
 
     size = path.stat().st_size
@@ -668,61 +819,24 @@ def hash_file(path: Path):
     return hash, byte_count
 
 
-def write_metadata_file(src_path: Path, hash, size: int) -> None:
-    info = {
-        "name": str(src_path),
-        "digest": hash.hexdigest(),
-        "size": size,
-    }
-    logging.info("File metadata: {}".format(info))
-
-    write_json(Path(METADATA_FILE_NAME), info)
-
-    logging.info("Wrote metadata file")
-
-
-def read_metadata_file(path: Path) -> T_JSON:
-    if path.stat().st_size > METADATA_FILE_SIZE_LIMIT:
-        raise InvalidMetadata("Metadata file is too large")
-
-    try:
-        info = load_json(path)
-    except json.JSONDecodeError as e:
-        raise InvalidMetadata("Failed to load metadata from {}".format(path)) from e
-
-    if not metadata_keys_present(info):
-        raise InvalidMetadata("Metadata file is missing keys")
-
-    info["size"] = int(info["size"])
-
-    return info
-
-
-def metadata_keys_present(metadata: T_JSON) -> bool:
-    return all(key in metadata for key in {"name", "digest", "size"})
-
-
 def analyze(transfer_manifest_path: Path) -> None:
     sync_request_start = None
     sync_request = {"files": {}, "xfer_files": set(), "verified_files": {}}
     dest_dir = transfer_manifest_path.parent.resolve()
     sync_count = 0
 
-    for (type, info), line_number in read_manifest(transfer_manifest_path):
+    for entry, line_number in read_manifest(transfer_manifest_path):
         # Format: SYNC_REQUEST {} files_at_source={} files_to_transfer={} bytes_to_transfer={} files_to_verify={} bytes_to_verify={} timestamp={}
-        if type is ManifestEntryType.SYNC_REQUEST:
+        if isinstance(entry, SyncRequest):
             sync_count += 1
             # if sync_request_start is not None:
             #    logging.error("Sync request started at line %d but never finished; inconsistent log",
             #        sync_request_start)
             #    sys.exit(4)
             sync_request_start = line_number
-            sync_request.update(info)
+            sync_request.update(entry._info)
         # Format: TRANSFER_REQUEST fname size
-        elif type in (
-            ManifestEntryType.TRANSFER_REQUEST,
-            ManifestEntryType.VERIFY_REQUEST,
-        ):
+        elif isinstance(entry, (TransferRequest, VerifyRequest)):
             if sync_request_start is None:
                 raise InconsistentManifest(
                     "Transfer request found at line {} before sync started; inconsistent log".format(
@@ -730,8 +844,8 @@ def analyze(transfer_manifest_path: Path) -> None:
                     )
                 )
 
-            size = info["size"]
-            fname = info["name"]
+            size = entry.size
+            fname = entry.name
 
             # File was previously verified.
             if sync_request["verified_files"].get(fname, None) == size:
@@ -739,10 +853,10 @@ def analyze(transfer_manifest_path: Path) -> None:
 
             sync_request["files"][fname] = size
 
-            if type is ManifestEntryType.TRANSFER_REQUEST:
-                sync_request["xfer_files"].add(info["name"])
+            if isinstance(entry, TransferRequest):
+                sync_request["xfer_files"].add(entry.name)
         # Format: TRANSFER_VERIFIED relative_fname hexdigest size timestamp:
-        elif type is ManifestEntryType.TRANSFER_VERIFIED:
+        elif isinstance(entry, TransferVerified):
             if sync_request_start is None:
                 raise InconsistentManifest(
                     "Transfer verification found at line {} before sync started; inconsistent log".format(
@@ -750,8 +864,8 @@ def analyze(transfer_manifest_path: Path) -> None:
                     )
                 )
 
-            fname = info["name"]
-            size = info["size"]
+            fname = entry.name
+            size = entry.size
 
             if sync_request["verified_files"].get(fname, None) == size:
                 continue
@@ -786,7 +900,7 @@ def analyze(transfer_manifest_path: Path) -> None:
             del sync_request["files"][fname]
 
             sync_request["verified_files"][fname] = size
-        elif type is ManifestEntryType.SYNC_DONE:
+        elif isinstance(entry, SyncDone):
             if sync_request_start is None:
                 raise InconsistentManifest(
                     "Transfer request found at line {} before sync started; inconsistent log".format(
@@ -831,13 +945,9 @@ def analyze(transfer_manifest_path: Path) -> None:
 
     if sync_request_start is not None:
         with transfer_manifest_path.open(mode="a") as f:
-            f.write(
-                format_manifest_entry(
-                    ManifestEntryType.SYNC_DONE, {"timestamp": timestamp()}
-                )
-            )
+            SyncDone(timestamp=timestamp()).write_entry_to(f)
         print("Synchronization done; verification complete.")
-    elif sync_count:
+    elif sync_count > 0:
         print("All synchronizations done; verification complete")
     else:
         raise InconsistentManifest("No synchronization found in manifest.")
@@ -988,6 +1098,7 @@ def main():
         cmd_info = load_json(args.json)
         # Split the DAG job name to get the cmd_info key
         info = cmd_info[args.fileid.split(":")[-1]]
+        print("VERIFYINFO", info)
         verify(
             Path(info["dest_prefix"]),
             Path(info["dest"]),
@@ -1000,21 +1111,15 @@ def main():
         analyze(args.transfer_manifest)
 
 
-def write_json(path: Path, j: T_JSON) -> None:
-    with path.open(mode="w") as f:
-        json.dump(j, f)
-
-
-def load_json(path: Path) -> T_JSON:
-    with path.open(mode="r") as f:
-        return json.load(f)
-
-
 if __name__ == "__main__":
-    logging.basicConfig(format="%(asctime)s ~ %(message)s", level=logging.INFO)
+    out = Path("/home/jtk/projects/htcondor_file_transfer/out")
+    with out.open(mode="a") as f, contextlib.redirect_stdout(
+        f
+    ), contextlib.redirect_stderr(f):
+        logging.basicConfig(format="%(asctime)s ~ %(message)s", level=logging.INFO)
 
-    try:
-        main()
-    except Exception as e:
-        logging.exception("Error: {}".format(e))
-        sys.exit(1)
+        try:
+            main()
+        except Exception as e:
+            logging.exception("Error: {}".format(e))
+            sys.exit(1)
