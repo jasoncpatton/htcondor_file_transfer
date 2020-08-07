@@ -1107,9 +1107,8 @@ def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(format="%(asctime)s ~ %(message)s", level=logging.INFO)
-
     try:
+        logging.basicConfig(format="%(asctime)s ~ %(message)s", level=logging.INFO)
         main()
     except Exception as e:
         logging.exception("Error: {}".format(e))
