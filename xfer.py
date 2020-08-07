@@ -131,13 +131,13 @@ class ManifestEntry(metaclass=abc.ABCMeta):
     def write_entry_to(self, file):
         file.write(self.to_entry())
 
-    @abc.abstractmethod
     @property
+    @abc.abstractmethod
     def keys(self) -> Tuple[str, ...]:
         raise NotImplementedError
 
-    @abc.abstractmethod
     @property
+    @abc.abstractmethod
     def type(self) -> ManifestEntryType:
         raise NotImplementedError
 
