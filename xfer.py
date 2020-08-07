@@ -498,8 +498,6 @@ def write_inner_dag(
 
     ensure_destination_dirs_exist(dest_prefix, files_to_xfer)
 
-    print(source_prefix)
-    print(dest_prefix)
     xfer_cmd_info = make_cmd_info(
         files_to_xfer, source_prefix, dest_prefix, transfer_manifest_path
     )
@@ -681,8 +679,6 @@ def verify(
     src_fname = entry.name
     src_hexdigest = entry.digest
     src_size = entry.size
-
-    print(dest, dest_prefix)
 
     logging.info("About to verify contents of %s", dest)
 
@@ -1098,7 +1094,6 @@ def main():
         cmd_info = load_json(args.json)
         # Split the DAG job name to get the cmd_info key
         info = cmd_info[args.fileid.split(":")[-1]]
-        print("VERIFYINFO", info)
         verify(
             Path(info["dest_prefix"]),
             Path(info["dest"]),
@@ -1112,14 +1107,10 @@ def main():
 
 
 if __name__ == "__main__":
-    out = Path("/home/jtk/projects/htcondor_file_transfer/out")
-    with out.open(mode="a") as f, contextlib.redirect_stdout(
-        f
-    ), contextlib.redirect_stderr(f):
-        logging.basicConfig(format="%(asctime)s ~ %(message)s", level=logging.INFO)
+    logging.basicConfig(format="%(asctime)s ~ %(message)s", level=logging.INFO)
 
-        try:
-            main()
-        except Exception as e:
-            logging.exception("Error: {}".format(e))
-            sys.exit(1)
+    try:
+        main()
+    except Exception as e:
+        logging.exception("Error: {}".format(e))
+        sys.exit(1)
