@@ -7,8 +7,26 @@ import json
 import os
 
 
-# VERIFY_REQUEST {"name": "Arlington_2020/Field 712/20200621_15-30-48/NDRE/IMG_00228.jpg", "size": 2579152}
+# SYNC_REQUEST /home/wcic/drone_data files_at_source=83682 files_to_transfer=8 bytes_to_transfer=0 files_to_verify=83674 bytes_to_verify=387976805206 timestamp=1596727332.650157
+# SYNC_REQUEST {"source_prefix": "/home/jtk/projects/htcondor_file_transfer/src", "files_at_source": 4, "files_to_transfer": 4, "bytes_to_transfer": 10289741842, "files_to_verify": 0, "bytes_to_verify": 0, "timestamp": 1596816337.0116978}
+def sync_request(source_prefix, *args):
+    data = {}
+    data['source_prefix'] = source_prefix
+    if len(args) != 6:
+        raise TypeError(f"Invalid number of SYNC_REQUEST arguments passed: {len(args)}")
+    for entry in args:
+        key, val = entry.split('=')
+        if not (key in ['files_at_source', 'files_to_transfer', 'bytes_to_transfer', 'files_to_verify', 'bytes_to_verify', 'timestamp']):
+            raise TypeError(f"Invalid key in SYNC_REQUEST arguments: {key}")
+        elif key in ['timestamp']:
+            data[key] = float(val)
+        else:
+            data[key] = int(val)
+    return f"SYNC_REQUEST {json.dumps(data)}\n"
+
+
 # VERIFY_REQUEST Madison_M1500_2020/20200613RGB/DJI_0070.JPG 7587670
+# VERIFY_REQUEST {"name": "Arlington_2020/Field 712/20200621_15-30-48/NDRE/IMG_00228.jpg", "size": 2579152}
 def verify_request(name, size):
     return f"VERIFY_REQUEST {json.dumps({'name': name, 'size': int(size)})}\n"
 
@@ -25,10 +43,27 @@ def transfer_verified(name, digest, size, timestamp):
     return f"TRANSFER_VERIFIED {json.dumps({'name': name, 'digest': digest, 'size': int(size), 'timestamp': int(timestamp)})}\n"
 
 
+# SYNC_DONE 1596776915
+# SYNC_DONE {"timestamp": 1596816381.1880395}
+def sync_done(timestamp):
+    return f"SYNC_DONE {json.dumps({'timestamp': float(timestamp)})}\n"
+
+
 CONVERT = {
+    "SYNC_REQUEST": sync_request,
+    "SYNC_DONE": sync_done,
     "VERIFY_REQUEST": verify_request,
     "TRANSFER_REQUEST": transfer_request,
     "TRANSFER_VERIFIED": transfer_verified,
+}
+
+
+TOKENS = {
+    "SYNC_REQUEST": 8,
+    "TRANSFER_REQUEST": 3,
+    "VERIFY_REQUEST": 3,
+    "TRANSFER_VERIFIED": 5,
+    "SYNC_DONE": 2,
 }
 
 
@@ -52,39 +87,23 @@ if __name__ == "__main__":
                 if len(tokens) < 1:
                     print(f"Bad line {i+1}, skipping: {line.rstrip()}")
                     skipped_lines += 1
-                elif tokens[0] in ["SYNC_REQUEST"] and len(tokens) == 8:
-                    f.write(line)
-                elif tokens[0] in ["SYNC_DONE"] and len(tokens) == 2:
-                    f.write(line)
-                elif tokens[0] in ["TRANSFER_REQUEST", "VERIFY_REQUEST"]:
+                elif tokens[0] in TOKENS:
                     if tokens[1].startswith("{") and tokens[-1].endswith("}"):
                         try:
                             json.loads(" ".join(tokens[1:]))
                             f.write(line)
-                        except json.decoder.JSONDecodeError:
-                            print(f"Bad line {i+1}, skipping: {line.rstrip()}")
+                        except Exception as e:
+                            print(f"Bad line {i+1}, raised {type(e).__name__}: {str(e)}, skipping: {line.rstrip()}")
                             skipped_lines += 1
-                    elif len(tokens) == 3 and not (
+                    elif len(tokens) == TOKENS[tokens[0]] and not (
                         "{" in "".join(tokens) or "}" in "".join(tokens)
                     ):
-                        newline = CONVERT[tokens[0]](*tokens[1:])
-                        f.write(newline)
-                    else:
-                        print(f"Bad line {i+1}, skipping: {line.rstrip()}")
-                        skipped_lines += 1
-                elif tokens[0] in ["TRANSFER_VERIFIED"]:
-                    if tokens[1].startswith("{") and tokens[-1].endswith("}"):
                         try:
-                            json.loads(" ".join(tokens[1:]))
-                            f.write(line)
-                        except json.decoder.JSONDecodeError:
-                            print(f"Bad line {i+1}, skipping: {line.rstrip()}")
+                            json_line = CONVERT[tokens[0]](*tokens[1:])
+                            f.write(json_line)
+                        except Exception as e:
+                            print(f"Bad line {i+1}, raised {type(e).__name__}: {str(e)}, skipping: {line.rstrip()}")
                             skipped_lines += 1
-                    elif len(tokens) == 5 and not (
-                        "{" in "".join(tokens) or "}" in "".join(tokens)
-                    ):
-                        newline = CONVERT[tokens[0]](*tokens[1:])
-                        f.write(newline)
                     else:
                         print(f"Bad line {i+1}, skipping: {line.rstrip()}")
                         skipped_lines += 1
